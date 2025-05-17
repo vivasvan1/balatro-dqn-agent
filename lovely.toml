@@ -1,0 +1,34 @@
+[manifest]
+version = "0.1.0"
+dump_lua = true
+priority = 0
+
+
+[[patches]] #   Patch Agent to main
+[patches.copy]
+target = "main.lua"
+position = "append"
+sources = ["agent_main.lua"]
+
+
+[[patches]] #   Initialize Agent
+[patches.pattern]
+target = "game.lua"
+pattern = "self:load_profile(G.SETTINGS.profile or 1)"
+position = "after"
+payload = "Agent.init()"
+match_indent = true
+overwrite = false
+
+[[patches]] #   Agent Update Loop
+[patches.pattern]
+target = "game.lua"
+pattern = "G.FRAMES.MOVE = G.FRAMES.MOVE + 1"
+position = "before"
+payload = '''
+if Agent and Agent.update then
+    Agent.update(dt)
+end
+'''
+match_indent = true
+overwrite = false
