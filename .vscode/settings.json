@@ -3,6 +3,7 @@
         "initBrainstorm",
         "initAgent",
         "nativefs",
-        "G"
+        "G",
+        "love"
     ]
 }

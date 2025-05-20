@@ -5,8 +5,8 @@ HOST = '0.0.0.0'
 PORT = 5000
 
 # Model settings
-STATE_SIZE = 512  # Size of the state representation (will need to be adjusted based on actual state size)
-ACTION_SIZE = 128  # Number of possible actions (will need to be adjusted based on actual action space)
+STATE_SIZE = 19  # Size of the state representation (19 elements: current_chips, hand_left, discards_left, 8 pairs of index-card)
+ACTION_SIZE = 256  # Binary representation: 8 bits for cards (1 bit per card) + 1 bit for play/discard
 HIDDEN_SIZE = 256  # Size of hidden layers in the neural network
 
 # Training settings
