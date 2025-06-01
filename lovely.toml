@@ -13,7 +13,7 @@ priority = 0
 [patches.copy]
 target = "main.lua"
 position = "append"
-sources = ["agent_main.lua"]
+sources = ["http.lua", "json.lua", "agent_main_consolidated.lua"]
 
 [[patches]]
 [patches.pattern]

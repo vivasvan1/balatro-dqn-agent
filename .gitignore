@@ -1,6 +1,4 @@
-G*.json
-hand_state*.json
-
+trash
 
 rnn_examples/3_cartpole/weights
 **/__pycache__
