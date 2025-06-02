@@ -2,3 +2,8 @@ trash
 
 rnn_examples/3_cartpole/weights
 **/__pycache__
+src/balatro_agent/logs/auto_save_episode_*_*_*.png
+src/balatro_agent/logs/episode_metrics_*_*_*.json
+src/balatro_agent/logs/training_metrics_*_*.json
+src/balatro_agent/weights/
+src/balatro_agent/mlflow_tracking/
