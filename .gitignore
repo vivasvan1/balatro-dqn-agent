@@ -10,3 +10,5 @@ src/balatro_agent/mlflow_tracking/
 src/balatro_agent/training_plots
 src/balatro_agent/mlruns
 src/balatro_agent/training_results_v2.png
+src/balatro_agent/training_plots_simple
+src/balatro_agent/diagnostics

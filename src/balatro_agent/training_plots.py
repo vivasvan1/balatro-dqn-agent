@@ -26,8 +26,10 @@ class TrainingPlotter:
             'discards_used': []
         }
         
-        # Create save directory
-        os.makedirs(save_dir, exist_ok=True)
+        # Create save directory with absolute path
+        self.save_dir = os.path.abspath(save_dir)
+        os.makedirs(self.save_dir, exist_ok=True)
+        print(f"📁 Training plots will be saved to: {self.save_dir}")
         
         # Set up matplotlib style
         plt.style.use('seaborn-v0_8')
@@ -144,8 +146,12 @@ class TrainingPlotter:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             plot_filename = f"training_progress_episode_{episode}_{timestamp}.png"
             plot_path = os.path.join(self.save_dir, plot_filename)
-            # plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-            # plt.close()
+            
+            # Ensure directory exists before saving
+            os.makedirs(os.path.dirname(plot_path), exist_ok=True)
+            
+            plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+            plt.close()
             
             # Log to MLflow if available
             if self.mlflow_tracker:
@@ -154,66 +160,6 @@ class TrainingPlotter:
                     print(f"📊 Training plot saved and logged to MLflow: {plot_filename}")
                 except Exception as e:
                     print(f"⚠️ Failed to log plot to MLflow: {e}")
-            
-            return plot_path
-        
-        plt.show()
-        return ""
-    
-    def plot_action_analysis(self, episode: int, save_plot: bool = True) -> str:
-        """Generate action analysis plots"""
-        
-        if len(self.plot_data['plays_used']) == 0 and len(self.plot_data['discards_used']) == 0:
-            return ""
-        
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-        fig.suptitle(f'Action Analysis - Episode {episode}', fontsize=16, fontweight='bold')
-        
-        # Plays used analysis
-        if len(self.plot_data['plays_used']) > 0:
-            plays_used = self.plot_data['plays_used']
-            episodes = range(1, len(plays_used) + 1)
-            
-            ax1.plot(episodes, plays_used, color='blue', linewidth=2, label='Plays Used')
-            ax1.axhline(y=3, color='red', linestyle='--', alpha=0.7, label='Max Plays (3)')
-            ax1.set_title('Plays Used per Episode', fontweight='bold')
-            ax1.set_xlabel('Episode')
-            ax1.set_ylabel('Plays Used')
-            ax1.set_ylim(0, 3.5)
-            ax1.legend()
-            ax1.grid(True, alpha=0.3)
-        
-        # Discards used analysis
-        if len(self.plot_data['discards_used']) > 0:
-            discards_used = self.plot_data['discards_used']
-            episodes = range(1, len(discards_used) + 1)
-            
-            ax2.plot(episodes, discards_used, color='orange', linewidth=2, label='Discards Used')
-            ax2.axhline(y=3, color='red', linestyle='--', alpha=0.7, label='Max Discards (3)')
-            ax2.set_title('Discards Used per Episode', fontweight='bold')
-            ax2.set_xlabel('Episode')
-            ax2.set_ylabel('Discards Used')
-            ax2.set_ylim(0, 3.5)
-            ax2.legend()
-            ax2.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        # Save plot
-        if save_plot:
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            plot_filename = f"action_analysis_episode_{episode}_{timestamp}.png"
-            plot_path = os.path.join(self.save_dir, plot_filename)
-            plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-            plt.close()
-            
-            # Log to MLflow if available
-            if self.mlflow_tracker:
-                try:
-                    self.mlflow_tracker.log_artifact(plot_path, "action_analysis")
-                    print(f"📊 Action analysis plot saved and logged to MLflow: {plot_filename}")
-                except Exception as e:
-                    print(f"⚠️ Failed to log action analysis plot to MLflow: {e}")
             
             return plot_path
         
@@ -287,6 +233,10 @@ class TrainingPlotter:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             plot_filename = f"training_summary_episode_{episode}_{timestamp}.png"
             plot_path = os.path.join(self.save_dir, plot_filename)
+            
+            # Ensure directory exists before saving
+            os.makedirs(os.path.dirname(plot_path), exist_ok=True)
+            
             plt.savefig(plot_path, dpi=300, bbox_inches='tight')
             plt.close()
             

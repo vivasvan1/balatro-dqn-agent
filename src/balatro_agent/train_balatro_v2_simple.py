@@ -1,303 +1,392 @@
+#!/usr/bin/env python3
+"""
+Training script for Simplified Balatro Gym Environment
+Uses reduced state space and improved hyperparameters for better training stability
+"""
+
 import os
+import sys
 import numpy as np
-import matplotlib.pyplot as plt
-from tqdm import tqdm
 import torch
+import torch.nn as nn
+import torch.optim as optim
+from collections import deque, namedtuple
+import random
+from typing import List, Tuple, Dict, Any
+import matplotlib.pyplot as plt
 from datetime import datetime
+import mlflow
+import mlflow.pytorch
 
-# Import our custom gym environment and DQN agent
-from balatro_gym_v2 import BalatroGymEnv
-from models.dqn_agent import DQNAgent
+# Add the current directory to the path
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# Training parameters
-LEARNING_RATE = 0.001
-N_EPISODES = 5000  # Reduced for faster testing
-START_EPSILON = 1.0
-EPSILON_DECAY = START_EPSILON / (N_EPISODES / 2)
-FINAL_EPSILON = 0.05
+from balatro_gym_v2_simple import BalatroGymEnvSimple
+from mlflow_tracker import MLflowTracker
+from training_plots import TrainingPlotter
 
-# Model parameters
-STATE_SIZE = 229  # Updated for enhanced observation space
-ACTION_SIZE = 436  # Valid actions with 1-5 card constraint
-BUFFER_SIZE = int(1e5)
+# Hyperparameters optimized for simplified environment
+LEARNING_RATE = 0.0001  # Further reduced for stability
 BATCH_SIZE = 64
 GAMMA = 0.99
-TAU = 1e-3
-UPDATE_EVERY = 4
+EPSILON_START = 1.0
+EPSILON_END = 0.05  # Higher minimum exploration
+EPSILON_DECAY = 0.999  # Much slower decay for stability
+MEMORY_SIZE = 10000
+TARGET_UPDATE = 100
+TRAINING_EPISODES = 100000
+EVAL_INTERVAL = 1000
+PLOT_INTERVAL = 500
+DIAGNOSTICS_INTERVAL = 1000
 
-def create_agent():
-    """Create and return a DQN agent configured for Balatro"""
-    return DQNAgent(
-        state_size=STATE_SIZE,
-        action_size=ACTION_SIZE,
-        buffer_size=BUFFER_SIZE,
-        batch_size=BATCH_SIZE,
-        gamma=GAMMA,
-        lr=LEARNING_RATE,
-        tau=TAU,
-        update_every=UPDATE_EVERY,
-        initial_epsilon=START_EPSILON,
-        epsilon_decay=EPSILON_DECAY,
-        final_epsilon=FINAL_EPSILON,
-        seed=42
-    )
-
-def save_model(agent, model_path):
-    """Save the trained model"""
-    try:
-        # Create directory if it doesn't exist
-        os.makedirs(os.path.dirname(model_path), exist_ok=True)
+# Simplified DQN Network for 23-dimensional state
+class SimpleDQN(nn.Module):
+    def __init__(self, state_size: int, action_size: int):
+        super(SimpleDQN, self).__init__()
         
-        # Save both local and target networks
-        torch.save(agent.qnetwork_local.state_dict(), f"{model_path}_local.pth")
-        torch.save(agent.qnetwork_target.state_dict(), f"{model_path}_target.pth")
-        print(f"💾 Model saved to {model_path}")
-        return True
-    except Exception as e:
-        print(f"❌ Failed to save model: {e}")
-        return False
+        # Smaller network for simplified state space
+        self.fc1 = nn.Linear(state_size, 128)  # Reduced from 256
+        self.fc2 = nn.Linear(128, 128)         # Reduced from 256
+        self.fc3 = nn.Linear(128, 64)          # New layer for better representation
+        self.fc4 = nn.Linear(64, action_size)
+        
+        self.dropout = nn.Dropout(0.1)  # Add dropout for regularization
+        
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = torch.relu(self.fc2(x))
+        x = self.dropout(x)
+        x = torch.relu(self.fc3(x))
+        x = self.fc4(x)
+        return x
 
-def evaluate_agent(agent, env, n_episodes=20):
-    """Evaluate the trained agent"""
-    print(f"\n🔍 Evaluating agent over {n_episodes} episodes...")
+class SimpleDQNAgent:
+    def __init__(self, state_size: int, action_size: int, device: str = 'cpu'):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.device = device
+        
+        # Networks
+        self.q_network = SimpleDQN(state_size, action_size).to(device)
+        self.target_network = SimpleDQN(state_size, action_size).to(device)
+        self.target_network.load_state_dict(self.q_network.state_dict())
+        
+        # Optimizer with reduced learning rate
+        self.optimizer = optim.Adam(self.q_network.parameters(), lr=LEARNING_RATE)
+        
+        # Training parameters
+        self.memory = deque(maxlen=MEMORY_SIZE)
+        self.epsilon = EPSILON_START
+        self.steps = 0
+        
+        # Experience tuple
+        self.Experience = namedtuple('Experience', ['state', 'action', 'reward', 'next_state', 'done'])
     
-    win_count = 0
+    def remember(self, state, action, reward, next_state, done):
+        self.memory.append(self.Experience(state, action, reward, next_state, done))
+    
+    def act(self, state, training=True):
+        if training and random.random() < self.epsilon:
+            return random.randrange(self.action_size)
+        
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        q_values = self.q_network(state_tensor)
+        return q_values.argmax().item()
+    
+    def replay(self, batch_size):
+        if len(self.memory) < batch_size:
+            return
+        
+        batch = random.sample(self.memory, batch_size)
+        states = torch.FloatTensor([e.state for e in batch]).to(self.device)
+        actions = torch.LongTensor([e.action for e in batch]).to(self.device)
+        rewards = torch.FloatTensor([e.reward for e in batch]).to(self.device)
+        next_states = torch.FloatTensor([e.next_state for e in batch]).to(self.device)
+        dones = torch.BoolTensor([e.done for e in batch]).to(self.device)
+        
+        current_q_values = self.q_network(states).gather(1, actions.unsqueeze(1))
+        next_q_values = self.target_network(next_states).max(1)[0].detach()
+        target_q_values = rewards + (GAMMA * next_q_values * ~dones)
+        
+        loss = nn.MSELoss()(current_q_values.squeeze(), target_q_values)
+        
+        self.optimizer.zero_grad()
+        loss.backward()
+        
+        # Gradient clipping to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), max_norm=0.5)  # Reduced for stability
+        
+        self.optimizer.step()
+        
+        # Update epsilon
+        if self.epsilon > EPSILON_END:
+            self.epsilon *= EPSILON_DECAY
+        
+        self.steps += 1
+        
+        # Update target network
+        if self.steps % TARGET_UPDATE == 0:
+            self.target_network.load_state_dict(self.q_network.state_dict())
+        
+        return loss.item()
+    
+    def save(self, filepath):
+        torch.save({
+            'q_network_state_dict': self.q_network.state_dict(),
+            'target_network_state_dict': self.target_network.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'epsilon': self.epsilon,
+            'steps': self.steps
+        }, filepath)
+    
+    def load(self, filepath):
+        checkpoint = torch.load(filepath, map_location=self.device)
+        self.q_network.load_state_dict(checkpoint['q_network_state_dict'])
+        self.target_network.load_state_dict(checkpoint['target_network_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.epsilon = checkpoint['epsilon']
+        self.steps = checkpoint['steps']
+
+def evaluate_agent(agent, env, episodes=100):
+    """Evaluate agent performance"""
+    wins = 0
     total_scores = []
-    avg_plays_used = []
-    avg_discards_used = []
+    total_rewards = []
     
-    # Add progress tracking
-    from tqdm import tqdm
-    
-    for episode in tqdm(range(n_episodes), desc="Evaluation"):
-        obs, _ = env.reset()
-        done = False
-        plays_used = 0
-        discards_used = 0
-        step_count = 0
-        max_steps = 50  # Prevent infinite loops
-        
-        while not done and step_count < max_steps:
-            # Use epsilon=0 for evaluation (no exploration)
-            action = agent.get_action(obs, eps=0.0)
-            obs, reward, done, truncated, info = env.step(action)
-            
-            # Track usage
-            if info.get("action_type") == "play":
-                plays_used += 1
-            elif info.get("action_type") == "discard":
-                discards_used += 1
-            
-            step_count += 1
-            
-            if truncated:
-                break
-        
-        if info.get("won", False):
-            win_count += 1
-        
-        total_scores.append(info.get("total_score", 0))
-        avg_plays_used.append(plays_used)
-        avg_discards_used.append(discards_used)
-    
-    win_rate = win_count / n_episodes
-    avg_score = np.mean(total_scores)
-    avg_plays = np.mean(avg_plays_used)
-    avg_discards = np.mean(avg_discards_used)
-    
-    print(f"📈 Evaluation Results:")
-    print(f"   Win Rate: {win_rate:.2%} ({win_count}/{n_episodes})")
-    print(f"   Average Score: {avg_score:.2f}")
-    print(f"   Average Plays Used: {avg_plays:.2f}/3")
-    print(f"   Average Discards Used: {avg_discards:.2f}/3")
-    print(f"   Best Score: {max(total_scores):.2f}")
-    
-    return win_rate, avg_score
-
-def plot_training_results(episode_rewards, win_rates, scores, save_path="training_results_v2_simple.png"):
-    """Plot training results"""
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
-    
-    # Episode rewards
-    ax1.plot(episode_rewards)
-    ax1.set_title('Episode Rewards')
-    ax1.set_xlabel('Episode')
-    ax1.set_ylabel('Reward')
-    ax1.grid(True)
-    
-    # Win rates (moving average)
-    if len(win_rates) > 0:
-        ax2.plot(win_rates)
-        ax2.set_title('Win Rate (100-episode moving average)')
-        ax2.set_xlabel('Episode (hundreds)')
-        ax2.set_ylabel('Win Rate')
-        ax2.grid(True)
-    
-    # Scores
-    ax3.plot(scores)
-    ax3.set_title('Episode Scores')
-    ax3.set_xlabel('Episode')
-    ax3.set_ylabel('Score')
-    ax3.grid(True)
-    
-    # Score distribution
-    if len(scores) > 0:
-        ax4.hist(scores, bins=30, alpha=0.7)
-        ax4.set_title('Score Distribution')
-        ax4.set_xlabel('Score')
-        ax4.set_ylabel('Frequency')
-        ax4.grid(True)
-    
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
-    print(f"📊 Training plots saved to {save_path}")
-
-def main():
-    """Main training function"""
-    print("🎰 Balatro DQN Training V2 (Simple)")
-    print("=" * 50)
-    
-    # Create environment and agent
-    env = BalatroGymEnv(blind_score=300)
-    agent = create_agent()
-    
-    # Model path
-    model_path = "weights/balatro_v2_simple_agent"
-    
-    # Training metrics
-    episode_rewards = []
-    episode_scores = []
-    win_rates = []
-    best_win_rate = 0.0
-    
-    print(f"\n🚀 Starting training for {N_EPISODES} episodes...")
-    print(f"📊 State size: {STATE_SIZE}, Action size: {ACTION_SIZE}")
-    print(f"🎯 Target epsilon: {FINAL_EPSILON}")
-    print(f"🏆 Blind score target: {env.blind_score}")
-    
-    # Training loop
-    for episode in tqdm(range(N_EPISODES), desc="Training Episodes"):
+    for _ in range(episodes):
         obs, _ = env.reset()
         episode_reward = 0
         done = False
         
-        # Play one episode
         while not done:
-            # Get action from agent
-            action = agent.get_action(obs)
-            
-            # Take action in environment
-            next_obs, reward, done, truncated, info = env.step(action)
-            
-            # Update agent
-            agent.step(obs, action, float(reward), next_obs, done)
-            
-            # Update episode tracking
+            action = agent.act(obs, training=False)
+            obs, reward, done, truncated, info = env.step(action)
             episode_reward += reward
-            obs = next_obs
-            
-            if truncated:
-                break
         
-        # Decay epsilon
-        agent.decay_epsilon()
-        
-        # Record metrics
-        episode_rewards.append(episode_reward)
-        episode_scores.append(info.get("total_score", 0))
-        
-        # Evaluate and print progress every 100 episodes
-        if (episode + 1) % 100 == 0:
-            recent_rewards = np.mean(episode_rewards[-100:])
-            recent_scores = np.mean(episode_scores[-100:])
-            recent_wins = sum(1 for i in range(-100, 0) if episode + i >= 0 and 
-                            episode_scores[episode + i] >= env.blind_score) / 100
-            
-            win_rates.append(recent_wins)
-            
-            print(f"\n📊 Episode {episode + 1}/{N_EPISODES}")
-            print(f"   Recent 100-episode average reward: {recent_rewards:.2f}")
-            print(f"   Recent 100-episode average score: {recent_scores:.2f}")
-            print(f"   Recent 100-episode win rate: {recent_wins:.2%}")
-            print(f"   Current epsilon: {agent.epsilon:.3f}")
-            print(f"   Buffer size: {len(agent.memory)}")
-            
-            # Save model if we have a new best win rate
-            if recent_wins > best_win_rate and episode >= 500:  # Wait for some training
-                best_win_rate = recent_wins
-                save_model(agent, f"{model_path}_best")
-                print(f"🏆 New best win rate! Saving model...")
-        
-        # Save model periodically
-        if (episode + 1) % 1000 == 0:
-            save_model(agent, f"{model_path}_checkpoint_{episode + 1}")
+        if info.get('won', False):
+            wins += 1
+        total_scores.append(info.get('total_score', 0))
+        total_rewards.append(episode_reward)
     
-    # Save final model
-    save_model(agent, model_path)
+    win_rate = wins / episodes
+    avg_score = np.mean(total_scores)
+    avg_reward = np.mean(total_rewards)
     
-    # Plot training results
-    plot_training_results(
-        episode_rewards, 
-        win_rates, 
-        episode_scores,
-        "training_results_v2_simple.png"
+    return win_rate, avg_score, avg_reward
+
+def main():
+    print("🎰 Training Simplified Balatro DQN Agent")
+    print("=" * 50)
+    
+    # Setup MLflow
+    mlflow_tracker = MLflowTracker(
+        experiment_name="balatro_simple_dqn"
+    )
+    mlflow_tracker.start_run(run_name=f"simple_dqn_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    
+    # Setup environment and agent
+    env = BalatroGymEnvSimple(blind_score=300)
+    state_size = env.observation_space.shape[0]
+    action_size = env.action_space.n
+    
+    print(f"State size: {state_size}")
+    print(f"Action size: {action_size}")
+    print(f"Learning rate: {LEARNING_RATE}")
+    print(f"Epsilon decay: {EPSILON_DECAY}")
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    agent = SimpleDQNAgent(state_size, action_size, device)
+    
+    # Try to load best model from MLflow artifacts if it exists
+    best_model_path = os.path.join("weights", "best_simple_model.pth")
+    if os.path.exists(best_model_path):
+        try:
+            agent.load(best_model_path)
+            print(f"📂 Loaded existing best model from: {best_model_path}")
+            print(f"   Epsilon: {agent.epsilon:.3f}")
+            print(f"   Steps: {agent.steps}")
+        except Exception as e:
+            print(f"⚠️ Failed to load existing model: {e}")
+            print("   Starting with fresh model")
+    else:
+        print("🆕 Starting with fresh model (no existing weights found)")
+    
+    # Setup plotting
+    plotter = TrainingPlotter(
+        save_dir="training_plots_simple",
+        mlflow_tracker=mlflow_tracker
     )
     
-    # Evaluate the trained agent
-    win_rate, avg_score = evaluate_agent(agent, env)
+    # Training loop
+    episode_rewards = []
+    episode_scores = []
+    episode_wins = []
+    episode_lengths = []
+    losses = []
+    
+    best_win_rate = 0.0
+    
+    print(f"\n🚀 Starting training for {TRAINING_EPISODES} episodes...")
+    print("-" * 50)
+    
+    for episode in range(1, TRAINING_EPISODES + 1):
+        obs, _ = env.reset()
+        episode_reward = 0
+        episode_length = 0
+        done = False
+        
+        while not done:
+            action = agent.act(obs, training=True)
+            next_obs, reward, done, truncated, info = env.step(action)
+            
+            agent.remember(obs, action, reward, next_obs, done)
+            obs = next_obs
+            episode_reward += reward
+            episode_length += 1
+            
+            # Train on batch
+            if len(agent.memory) > BATCH_SIZE:
+                loss = agent.replay(BATCH_SIZE)
+                if loss is not None:
+                    losses.append(loss)
+        
+        # Record episode data
+        episode_rewards.append(episode_reward)
+        episode_scores.append(info.get('total_score', 0))
+        episode_wins.append(1 if info.get('won', False) else 0)
+        episode_lengths.append(episode_length)
+        
+        # Log to MLflow
+        mlflow_tracker.log_custom_metric('episode_reward', episode_reward, step=episode)
+        mlflow_tracker.log_custom_metric('episode_score', info.get('total_score', 0), step=episode)
+        mlflow_tracker.log_custom_metric('episode_won', 1 if info.get('won', False) else 0, step=episode)
+        mlflow_tracker.log_custom_metric('episode_length', episode_length, step=episode)
+        mlflow_tracker.log_custom_metric('epsilon', agent.epsilon, step=episode)
+        mlflow_tracker.log_custom_metric('memory_size', len(agent.memory), step=episode)
+        
+        # Print progress
+        if episode % 100 == 0:
+            recent_rewards = episode_rewards[-100:]
+            recent_wins = episode_wins[-100:]
+            recent_scores = episode_scores[-100:]
+            
+            avg_reward = np.mean(recent_rewards)
+            win_rate = np.mean(recent_wins)
+            avg_score = np.mean(recent_scores)
+            
+            print(f"Episode {episode:5d} | "
+                  f"Avg Reward: {avg_reward:6.2f} | "
+                  f"Win Rate: {win_rate:5.1%} | "
+                  f"Avg Score: {avg_score:6.1f} | "
+                  f"Epsilon: {agent.epsilon:.3f}")
+        
+        # Evaluation
+        if episode % EVAL_INTERVAL == 0:
+            win_rate, avg_score, avg_reward = evaluate_agent(agent, env, episodes=50)
+            
+            print(f"\n📊 Evaluation at Episode {episode}:")
+            print(f"   Win Rate: {win_rate:.1%}")
+            print(f"   Avg Score: {avg_score:.1f}")
+            print(f"   Avg Reward: {avg_reward:.2f}")
+            
+            # Log evaluation metrics
+            mlflow_tracker.log_custom_metric('eval_win_rate', win_rate, step=episode)
+            mlflow_tracker.log_custom_metric('eval_avg_score', avg_score, step=episode)
+            mlflow_tracker.log_custom_metric('eval_avg_reward', avg_reward, step=episode)
+            
+            # Save best model
+            if win_rate > best_win_rate:
+                best_win_rate = win_rate
+                model_path = os.path.join("weights", "best_simple_model.pth")
+                os.makedirs("weights", exist_ok=True)
+                agent.save(model_path)
+                mlflow_tracker.log_artifact(model_path, "models")
+                print(f"   🏆 New best model saved! Win rate: {win_rate:.1%}")
+        
+        # Plotting
+        if episode % PLOT_INTERVAL == 0:
+            plotter.add_data_point(episode, {
+                'episode_rewards': episode_reward,
+                'episode_scores': info.get('total_score', 0),
+                'win_rates': 1 if info.get('won', False) else 0,
+                'episode_lengths': episode_length,
+                'epsilon_values': agent.epsilon,
+                'buffer_sizes': len(agent.memory),
+                # 'losses': losses[-1] if losses else 0  # Optionally add latest loss
+            })
+            
+            plotter.plot_training_progress(episode)
+        
+        # Diagnostics
+        if episode % DIAGNOSTICS_INTERVAL == 0:
+            # Run diagnostics
+            recent_episodes = 1000
+            if len(episode_rewards) >= recent_episodes:
+                recent_rewards = episode_rewards[-recent_episodes:]
+                recent_scores = episode_scores[-recent_episodes:]
+                recent_wins = episode_wins[-recent_episodes:]
+                
+                # Calculate trends
+                reward_trend = np.polyfit(range(len(recent_rewards)), recent_rewards, 1)[0]
+                score_trend = np.polyfit(range(len(recent_scores)), recent_scores, 1)[0]
+                
+                print(f"\n🔍 Training Diagnostics Report - Episode {episode}")
+                print("=" * 60)
+                print(f"📈 Learning Progress:")
+                print(f"   Reward trend: {reward_trend:.4f} {'✅' if reward_trend > 0 else '❌'}")
+                print(f"   Score trend: {score_trend:.4f} {'✅' if score_trend > 0 else '❌'}")
+                print(f"   Exploration decreasing: {'✅' if agent.epsilon < 0.5 else '❌'}")
+                print(f"   Average reward: {np.mean(recent_rewards):.2f}")
+                print(f"   Average score: {np.mean(recent_scores):.2f}")
+                
+                print(f"\n🎯 Performance Analysis:")
+                print(f"   Win rate: {np.mean(recent_wins):.1%}")
+                print(f"   Score range: {min(recent_scores)} - {max(recent_scores)}")
+                print(f"   Score variance: {np.var(recent_scores):.2f}")
+                
+                # Recommendations
+                print(f"\n💡 Recommendations:")
+                if reward_trend < 0:
+                    print("   1. ⚠️ Rewards decreasing - consider reducing learning rate further")
+                if np.mean(recent_scores) < 200:
+                    print("   2. 🎯 Low scores - consider improving reward shaping")
+                if agent.epsilon > 0.3:
+                    print("   3. 🔍 High exploration - training may need more episodes")
+                if np.var(recent_scores) > 5000:
+                    print("   4. 📊 High variance - consider stabilizing training")
+    
+    # Final evaluation and save
+    print(f"\n🎯 Final Evaluation:")
+    win_rate, avg_score, avg_reward = evaluate_agent(agent, env, episodes=100)
+    print(f"   Final Win Rate: {win_rate:.1%}")
+    print(f"   Final Avg Score: {avg_score:.1f}")
+    print(f"   Final Avg Reward: {avg_reward:.2f}")
+    
+    # Save final model
+    final_model_path = os.path.join("weights", "final_simple_model.pth")
+    agent.save(final_model_path)
+    mlflow_tracker.log_artifact(final_model_path, "models")
+    
+    # Final plots
+    plotter.add_data_point(TRAINING_EPISODES, {
+        'episode_rewards': episode_rewards[-1] if episode_rewards else 0,
+        'episode_scores': episode_scores[-1] if episode_scores else 0,
+        'win_rates': episode_wins[-1] if episode_wins else 0,
+        'episode_lengths': episode_lengths[-1] if episode_lengths else 0,
+        'epsilon_values': agent.epsilon,
+        'buffer_sizes': len(agent.memory),
+        # 'losses': losses[-1] if losses else 0
+    })
+    
+    plotter.plot_final_summary(TRAINING_EPISODES)
     
     print(f"\n✅ Training completed!")
-    print(f"🏆 Final win rate: {win_rate:.2%}")
-    print(f"📈 Final average score: {avg_score:.2f}")
-    print(f"💾 Model saved to: {model_path}")
-    
-    # Test the agent with a few example games
-    print(f"\n🎮 Testing agent with example games...")
-    test_agent_behavior(agent, env)
-
-def test_agent_behavior(agent, env, n_tests=2):
-    """Test the agent's behavior with some example games"""
-    for test in range(n_tests):
-        print(f"\n🎯 Test Game {test + 1}")
-        print("=" * 30)
-        
-        obs, _ = env.reset()
-        step = 0
-        
-        while not env.game_over and step < 10:  # Limit steps to prevent infinite loops
-            env.render()
-            
-            # Get agent's action
-            action = agent.get_action(obs, eps=0.0)  # No exploration
-            
-            # Decode action
-            action_type, card_indices = env._decode_action(action)
-            selected_cards = [str(env.hand[i]) for i in card_indices if i < len(env.hand)]
-            
-            print(f"🤖 Agent Decision:")
-            print(f"   Action: {action} -> {action_type}")
-            print(f"   Selected cards: {selected_cards}")
-            
-            # Take the action
-            obs, reward, done, truncated, info = env.step(action)
-            
-            print(f"   Reward: {reward:.2f}")
-            if info.get("action_type") == "play":
-                print(f"   Hand type: {info.get('hand_type', 'Unknown')}")
-                print(f"   Score gained: {info.get('score_gained', 0)}")
-            print(f"   Total score: {info.get('total_score', 0)}")
-            print()
-            
-            step += 1
-            
-            if done or truncated:
-                break
-        
-        env.render()
-        result = "WON" if env.won else "LOST"
-        print(f"🏁 Game {test + 1} Result: {result}")
-        print("-" * 50)
+    print(f"📁 Models saved to: weights/")
+    print(f"📊 Plots saved to: training_plots_simple/")
+    print(f"📈 MLflow experiment: {mlflow_tracker.experiment_name}")
 
 if __name__ == "__main__":
     main() 

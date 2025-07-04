@@ -10,6 +10,7 @@ from balatro_gym_v2 import BalatroGymEnv
 from models.dqn_agent import DQNAgent
 from mlflow_tracker import MLflowTracker
 from training_plots import create_plotter
+from training_diagnostics import create_diagnostics
 
 # Training parameters
 LEARNING_RATE = 0.001
@@ -187,8 +188,9 @@ def main():
     run_name = f"balatro_v2_training_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     mlflow_tracker.start_run(run_name)
     
-    # Initialize training plotter
+    # Initialize training plotter and diagnostics
     plotter = create_plotter(mlflow_tracker)
+    diagnostics = create_diagnostics()
     
     # Training metrics
     episode_rewards = []
@@ -208,6 +210,11 @@ def main():
         done = False
         
         # Play one episode
+        step_count = 0
+        max_hand_score = 0
+        hand_scores = []
+        invalid_actions = 0
+        
         while not done:
             # Get action from agent
             action = agent.get_action(obs)
@@ -215,12 +222,22 @@ def main():
             # Take action in environment
             next_obs, reward, done, truncated, info = env.step(action)
             
+            # Track hand scores and invalid actions
+            if info.get("action_type") == "play":
+                score_gained = info.get("score_gained", 0)
+                hand_scores.append(score_gained)
+                max_hand_score = max(max_hand_score, score_gained)
+            
+            if info.get("error"):
+                invalid_actions += 1
+            
             # Update agent
             agent.step(obs, action, float(reward), next_obs, done)
             
             # Update episode tracking
             episode_reward += reward
             obs = next_obs
+            step_count += 1
             
             if truncated:
                 break
@@ -232,6 +249,14 @@ def main():
         episode_rewards.append(episode_reward)
         episode_scores.append(info.get("total_score", 0))
         
+        # Determine game end reason
+        game_end_reason = "won" if info.get("won", False) else "unknown"
+        if not info.get("won", False):
+            if info.get("plays_left", 0) <= 0:
+                game_end_reason = "no_plays_left"
+            elif info.get("total_score", 0) < env.blind_score:
+                game_end_reason = "low_score"
+        
         # Add data to plotter
         plot_data = {
             'episode_rewards': episode_reward,
@@ -242,6 +267,23 @@ def main():
             'discards_used': 3 - info.get("discards_left", 0)
         }
         plotter.add_data_point(episode, plot_data)
+        
+        # Add detailed data to diagnostics
+        diagnostic_data = {
+            'episode_rewards': episode_reward,
+            'episode_scores': info.get("total_score", 0),
+            'won': info.get("won", False),
+            'plays_used': 3 - info.get("plays_left", 0),
+            'discards_used': 3 - info.get("discards_left", 0),
+            'epsilon_values': agent.epsilon,
+            'steps_taken': step_count,
+            'final_hand_size': len(env.hand),
+            'max_hand_score': max_hand_score,
+            'avg_hand_score': np.mean(hand_scores) if hand_scores else 0,
+            'invalid_actions': invalid_actions,
+            'game_end_reason': game_end_reason
+        }
+        diagnostics.add_episode_data(episode, diagnostic_data)
         
         # Log to MLflow
         mlflow_tracker.log_custom_metric('episode_reward', episode_reward, step=episode)
@@ -275,6 +317,18 @@ def main():
             if (episode + 1) % 500 == 0:
                 plotter.plot_training_progress(episode + 1)
                 print(f"📊 Training plots generated and saved to MLflow")
+            
+            # Run diagnostics every 1000 episodes
+            if (episode + 1) % 1000 == 0:
+                print(f"\n🔍 Running training diagnostics...")
+                diagnostics.print_diagnostic_report(episode + 1)
+                diagnostic_plot_path = diagnostics.plot_diagnostic_summary(episode + 1)
+                if diagnostic_plot_path and mlflow_tracker:
+                    try:
+                        mlflow_tracker.log_artifact(diagnostic_plot_path, "diagnostics")
+                        print(f"📊 Diagnostic plot saved to MLflow")
+                    except Exception as e:
+                        print(f"⚠️ Failed to log diagnostic plot to MLflow: {e}")
             
             # Save model if we have a new best win rate
             if recent_wins > best_win_rate and episode >= 1000:  # Wait for some training
