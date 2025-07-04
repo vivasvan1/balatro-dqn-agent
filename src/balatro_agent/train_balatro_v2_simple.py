@@ -17,6 +17,19 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 import mlflow
 import mlflow.pytorch
+import time
+
+# Check for TPU availability
+try:
+    import torch_xla
+    import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.parallel_loader as pl
+    TPU_AVAILABLE = True
+except ImportError:
+    TPU_AVAILABLE = False
+
+# Check for GPU availability
+GPU_AVAILABLE = torch.cuda.is_available()
 
 # Add the current directory to the path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -27,39 +40,74 @@ from training_plots import TrainingPlotter
 
 # Hyperparameters optimized for simplified environment
 LEARNING_RATE = 0.0001  # Further reduced for stability
-BATCH_SIZE = 64
+BATCH_SIZE = 128 if GPU_AVAILABLE or TPU_AVAILABLE else 64  # Larger batch size for GPU/TPU
 GAMMA = 0.99
 EPSILON_START = 1.0
 EPSILON_END = 0.05  # Higher minimum exploration
 EPSILON_DECAY = 0.999  # Much slower decay for stability
-MEMORY_SIZE = 10000
+MEMORY_SIZE = 50000 if GPU_AVAILABLE or TPU_AVAILABLE else 10000  # Larger memory for GPU/TPU
 TARGET_UPDATE = 100
 TRAINING_EPISODES = 100000
 EVAL_INTERVAL = 1000
 PLOT_INTERVAL = 500
 DIAGNOSTICS_INTERVAL = 1000
 
+# GPU/TPU optimization settings
+MIXED_PRECISION = True  # Use mixed precision training
+GRADIENT_ACCUMULATION_STEPS = 2 if GPU_AVAILABLE or TPU_AVAILABLE else 1  # Gradient accumulation
+
 # Simplified DQN Network for 23-dimensional state
 class SimpleDQN(nn.Module):
     def __init__(self, state_size: int, action_size: int):
         super(SimpleDQN, self).__init__()
         
-        # Smaller network for simplified state space
-        self.fc1 = nn.Linear(state_size, 128)  # Reduced from 256
-        self.fc2 = nn.Linear(128, 128)         # Reduced from 256
-        self.fc3 = nn.Linear(128, 64)          # New layer for better representation
-        self.fc4 = nn.Linear(64, action_size)
+        # Optimized network for GPU/TPU
+        self.fc1 = nn.Linear(state_size, 256)  # Increased for better GPU utilization
+        self.fc2 = nn.Linear(256, 256)         # Increased for better GPU utilization
+        self.fc3 = nn.Linear(256, 128)         # Increased for better GPU utilization
+        self.fc4 = nn.Linear(128, action_size)
+        
+        # Batch normalization for faster training
+        self.bn1 = nn.BatchNorm1d(256)
+        self.bn2 = nn.BatchNorm1d(256)
+        self.bn3 = nn.BatchNorm1d(128)
         
         self.dropout = nn.Dropout(0.1)  # Add dropout for regularization
         
+        # Initialize weights for better convergence
+        self._init_weights()
+        
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.kaiming_normal_(module.weight, nonlinearity='relu')
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        
     def forward(self, x):
-        x = torch.relu(self.fc1(x))
+        # Handle both single samples and batches
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        
+        x = self.fc1(x)
+        if x.size(0) > 1:  # Only apply batch norm for batches
+            x = self.bn1(x)
+        x = torch.relu(x)
         x = self.dropout(x)
-        x = torch.relu(self.fc2(x))
+        
+        x = self.fc2(x)
+        if x.size(0) > 1:
+            x = self.bn2(x)
+        x = torch.relu(x)
         x = self.dropout(x)
-        x = torch.relu(self.fc3(x))
+        
+        x = self.fc3(x)
+        if x.size(0) > 1:
+            x = self.bn3(x)
+        x = torch.relu(x)
         x = self.fc4(x)
-        return x
+        
+        return x.squeeze(0) if x.size(0) == 1 else x
 
 class SimpleDQNAgent:
     def __init__(self, state_size: int, action_size: int, device: str = 'cpu'):
@@ -72,13 +120,30 @@ class SimpleDQNAgent:
         self.target_network = SimpleDQN(state_size, action_size).to(device)
         self.target_network.load_state_dict(self.q_network.state_dict())
         
-        # Optimizer with reduced learning rate
-        self.optimizer = optim.Adam(self.q_network.parameters(), lr=LEARNING_RATE)
+        # Optimizer with reduced learning rate and weight decay
+        self.optimizer = optim.AdamW(
+            self.q_network.parameters(), 
+            lr=LEARNING_RATE, 
+            weight_decay=1e-4,
+            betas=(0.9, 0.999)
+        )
+        
+        # Learning rate scheduler
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='max', factor=0.5, patience=1000, verbose=True
+        )
+        
+        # Mixed precision training
+        if MIXED_PRECISION and (GPU_AVAILABLE or TPU_AVAILABLE):
+            self.scaler = torch.cuda.amp.GradScaler() if GPU_AVAILABLE else None
+        else:
+            self.scaler = None
         
         # Training parameters
         self.memory = deque(maxlen=MEMORY_SIZE)
         self.epsilon = EPSILON_START
         self.steps = 0
+        self.gradient_accumulation_counter = 0
         
         # Experience tuple
         self.Experience = namedtuple('Experience', ['state', 'action', 'reward', 'next_state', 'done'])
@@ -90,9 +155,10 @@ class SimpleDQNAgent:
         if training and random.random() < self.epsilon:
             return random.randrange(self.action_size)
         
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-        q_values = self.q_network(state_tensor)
-        return q_values.argmax().item()
+        with torch.no_grad():
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            q_values = self.q_network(state_tensor)
+            return q_values.argmax().item()
     
     def replay(self, batch_size):
         if len(self.memory) < batch_size:
@@ -105,19 +171,41 @@ class SimpleDQNAgent:
         next_states = torch.FloatTensor([e.next_state for e in batch]).to(self.device)
         dones = torch.BoolTensor([e.done for e in batch]).to(self.device)
         
-        current_q_values = self.q_network(states).gather(1, actions.unsqueeze(1))
-        next_q_values = self.target_network(next_states).max(1)[0].detach()
-        target_q_values = rewards + (GAMMA * next_q_values * ~dones)
-        
-        loss = nn.MSELoss()(current_q_values.squeeze(), target_q_values)
-        
-        self.optimizer.zero_grad()
-        loss.backward()
-        
-        # Gradient clipping to prevent exploding gradients
-        torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), max_norm=0.5)  # Reduced for stability
-        
-        self.optimizer.step()
+        # Use mixed precision if available
+        if self.scaler is not None:
+            with torch.cuda.amp.autocast():
+                current_q_values = self.q_network(states).gather(1, actions.unsqueeze(1))
+                next_q_values = self.target_network(next_states).max(1)[0].detach()
+                target_q_values = rewards + (GAMMA * next_q_values * ~dones)
+                loss = nn.MSELoss()(current_q_values.squeeze(), target_q_values)
+            
+            # Scale loss and backward pass
+            self.scaler.scale(loss).backward()
+            
+            # Gradient accumulation
+            self.gradient_accumulation_counter += 1
+            if self.gradient_accumulation_counter % GRADIENT_ACCUMULATION_STEPS == 0:
+                # Gradient clipping
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), max_norm=1.0)
+                
+                # Optimizer step
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad()
+        else:
+            # Standard training without mixed precision
+            current_q_values = self.q_network(states).gather(1, actions.unsqueeze(1))
+            next_q_values = self.target_network(next_states).max(1)[0].detach()
+            target_q_values = rewards + (GAMMA * next_q_values * ~dones)
+            loss = nn.MSELoss()(current_q_values.squeeze(), target_q_values)
+            
+            self.optimizer.zero_grad()
+            loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), max_norm=1.0)
+            self.optimizer.step()
         
         # Update epsilon
         if self.epsilon > EPSILON_END:
@@ -136,8 +224,10 @@ class SimpleDQNAgent:
             'q_network_state_dict': self.q_network.state_dict(),
             'target_network_state_dict': self.target_network.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
             'epsilon': self.epsilon,
-            'steps': self.steps
+            'steps': self.steps,
+            'scaler_state_dict': self.scaler.state_dict() if self.scaler else None
         }, filepath)
     
     def load(self, filepath):
@@ -145,8 +235,15 @@ class SimpleDQNAgent:
         self.q_network.load_state_dict(checkpoint['q_network_state_dict'])
         self.target_network.load_state_dict(checkpoint['target_network_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        if 'scheduler_state_dict' in checkpoint:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
         self.epsilon = checkpoint['epsilon']
         self.steps = checkpoint['steps']
+        
+        if 'scaler_state_dict' in checkpoint and checkpoint['scaler_state_dict'] and self.scaler:
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
 
 def evaluate_agent(agent, env, episodes=100):
     """Evaluate agent performance"""
@@ -176,7 +273,7 @@ def evaluate_agent(agent, env, episodes=100):
     return win_rate, avg_score, avg_reward
 
 def main():
-    print("🎰 Training Simplified Balatro DQN Agent")
+    print("🎰 Training Simplified Balatro DQN Agent (GPU/TPU Optimized)")
     print("=" * 50)
     
     # Setup MLflow
@@ -194,9 +291,23 @@ def main():
     print(f"Action size: {action_size}")
     print(f"Learning rate: {LEARNING_RATE}")
     print(f"Epsilon decay: {EPSILON_DECAY}")
+    print(f"Batch size: {BATCH_SIZE}")
+    print(f"Memory size: {MEMORY_SIZE}")
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    # Device setup
+    if TPU_AVAILABLE:
+        device = xm.xla_device()
+        print(f"🚀 Using TPU: {device}")
+    elif GPU_AVAILABLE:
+        device = torch.device("cuda")
+        print(f"🎮 Using GPU: {torch.cuda.get_device_name()}")
+        print(f"   Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    else:
+        device = torch.device("cpu")
+        print(f"💻 Using CPU")
+    
+    print(f"Mixed precision: {MIXED_PRECISION and (GPU_AVAILABLE or TPU_AVAILABLE)}")
+    print(f"Gradient accumulation steps: {GRADIENT_ACCUMULATION_STEPS}")
     
     agent = SimpleDQNAgent(state_size, action_size, device)
     
@@ -228,6 +339,7 @@ def main():
     losses = []
     
     best_win_rate = 0.0
+    start_time = time.time()
     
     print(f"\n🚀 Starting training for {TRAINING_EPISODES} episodes...")
     print("-" * 50)
@@ -277,11 +389,15 @@ def main():
             win_rate = np.mean(recent_wins)
             avg_score = np.mean(recent_scores)
             
+            elapsed_time = time.time() - start_time
+            episodes_per_sec = episode / elapsed_time
+            
             print(f"Episode {episode:5d} | "
                   f"Avg Reward: {avg_reward:6.2f} | "
                   f"Win Rate: {win_rate:5.1%} | "
                   f"Avg Score: {avg_score:6.1f} | "
-                  f"Epsilon: {agent.epsilon:.3f}")
+                  f"Epsilon: {agent.epsilon:.3f} | "
+                  f"Speed: {episodes_per_sec:.1f} ep/s")
         
         # Evaluation
         if episode % EVAL_INTERVAL == 0:
@@ -305,6 +421,9 @@ def main():
                 agent.save(model_path)
                 mlflow_tracker.log_artifact(model_path, "models")
                 print(f"   🏆 New best model saved! Win rate: {win_rate:.1%}")
+                
+                # Update learning rate scheduler
+                agent.scheduler.step(win_rate)
         
         # Plotting
         if episode % PLOT_INTERVAL == 0:
@@ -359,11 +478,14 @@ def main():
                     print("   4. 📊 High variance - consider stabilizing training")
     
     # Final evaluation and save
+    total_time = time.time() - start_time
     print(f"\n🎯 Final Evaluation:")
     win_rate, avg_score, avg_reward = evaluate_agent(agent, env, episodes=100)
     print(f"   Final Win Rate: {win_rate:.1%}")
     print(f"   Final Avg Score: {avg_score:.1f}")
     print(f"   Final Avg Reward: {avg_reward:.2f}")
+    print(f"   Total Training Time: {total_time/3600:.1f} hours")
+    print(f"   Average Speed: {TRAINING_EPISODES/total_time:.1f} episodes/second")
     
     # Save final model
     final_model_path = os.path.join("weights", "final_simple_model.pth")
@@ -387,6 +509,9 @@ def main():
     print(f"📁 Models saved to: weights/")
     print(f"📊 Plots saved to: training_plots_simple/")
     print(f"📈 MLflow experiment: {mlflow_tracker.experiment_name}")
+    print(f"⚡ Performance: {TRAINING_EPISODES/total_time:.1f} episodes/second")
+    if GPU_AVAILABLE:
+        print(f"🎮 GPU Memory Used: {torch.cuda.max_memory_allocated()/1e9:.1f} GB")
 
 if __name__ == "__main__":
     main() 
