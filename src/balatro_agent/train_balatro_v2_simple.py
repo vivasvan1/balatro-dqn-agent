@@ -15,8 +15,6 @@ import random
 from typing import List, Tuple, Dict, Any
 import matplotlib.pyplot as plt
 from datetime import datetime
-import mlflow
-import mlflow.pytorch
 import time
 
 # Check for TPU availability
@@ -35,26 +33,157 @@ GPU_AVAILABLE = torch.cuda.is_available()
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from balatro_gym_v2_simple import BalatroGymEnvSimple
-from mlflow_tracker import MLflowTracker
 from training_plots import TrainingPlotter
 
 # Hyperparameters optimized for simplified environment
-LEARNING_RATE = 0.0001  # Further reduced for stability
+LEARNING_RATE = 0.00005  # Further reduced for stability
 BATCH_SIZE = 128 if GPU_AVAILABLE or TPU_AVAILABLE else 64  # Larger batch size for GPU/TPU
 GAMMA = 0.99
+
+# Epsilon decay strategies
 EPSILON_START = 1.0
-EPSILON_END = 0.05  # Higher minimum exploration
-EPSILON_DECAY = 0.999  # Much slower decay for stability
+EPSILON_END = 0.1  # Increased minimum exploration from 0.01 to 0.1
+EPSILON_DECAY_TYPE = "curriculum"  # Changed to curriculum for staged exploration
+
+# Manual epsilon override for aggressive exploration (set to None to use decay)
+MANUAL_EPSILON = 0.15  # Reduced to 0.15 to reduce random High Card plays
+
+# For exponential decay
+EPSILON_DECAY_RATE = 0.9999  # Even slower decay for more exploration
+
+# For adaptive decay (based on performance)
+ADAPTIVE_DECAY_MIN_EPISODES = 1000  # Minimum episodes before adaptive decay
+ADAPTIVE_DECAY_PERFORMANCE_THRESHOLD = 0.1  # Win rate threshold for faster decay
+
+# For curriculum decay (staged learning)
+CURRICULUM_STAGES = [
+    {"episodes": 10000, "epsilon": 0.9},   # Very high exploration initially
+    {"episodes": 25000, "epsilon": 0.7},   # High exploration
+    {"episodes": 50000, "epsilon": 0.4},   # Medium exploration
+    {"episodes": 75000, "epsilon": 0.2},   # Lower exploration
+    {"episodes": float('inf'), "epsilon": 0.1}  # Minimum exploration (increased)
+]
+
 MEMORY_SIZE = 50000 if GPU_AVAILABLE or TPU_AVAILABLE else 10000  # Larger memory for GPU/TPU
 TARGET_UPDATE = 100
 TRAINING_EPISODES = 100000
-EVAL_INTERVAL = 1000
+EVAL_INTERVAL = 5000  # Further reduced evaluation frequency to avoid slowdowns
 PLOT_INTERVAL = 500
-DIAGNOSTICS_INTERVAL = 1000
 
 # GPU/TPU optimization settings
 MIXED_PRECISION = True  # Use mixed precision training
 GRADIENT_ACCUMULATION_STEPS = 2 if GPU_AVAILABLE or TPU_AVAILABLE else 1  # Gradient accumulation
+
+class SmartEpsilonDecay:
+    """Advanced epsilon decay strategies for better exploration-exploitation balance"""
+    
+    def __init__(self, decay_type="exponential", **kwargs):
+        self.decay_type = decay_type
+        self.steps = 0
+        self.episodes = 0
+        self.current_epsilon = EPSILON_START
+        
+        # Performance tracking for adaptive decay
+        self.recent_performances = deque(maxlen=100)
+        self.performance_history = []
+        
+        # Curriculum stage tracking
+        self.curriculum_stage = 0
+        
+        # Decay parameters
+        if decay_type == "linear":
+            self.decay_rate = kwargs.get('decay_rate', 0.0001)
+        elif decay_type == "exponential":
+            self.decay_rate = kwargs.get('decay_rate', EPSILON_DECAY_RATE)
+        elif decay_type == "adaptive":
+            self.min_episodes = kwargs.get('min_episodes', ADAPTIVE_DECAY_MIN_EPISODES)
+            self.performance_threshold = kwargs.get('performance_threshold', ADAPTIVE_DECAY_PERFORMANCE_THRESHOLD)
+        elif decay_type == "curriculum":
+            self.stages = kwargs.get('stages', CURRICULUM_STAGES)
+        
+        # Ensure decay_rate is always initialized
+        if not hasattr(self, 'decay_rate'):
+            self.decay_rate = EPSILON_DECAY_RATE
+    
+    def update(self, episode_performance=None):
+        """Update epsilon based on the chosen decay strategy"""
+        self.steps += 1
+        
+        if self.decay_type == "linear":
+            self.current_epsilon = max(EPSILON_END, EPSILON_START - self.decay_rate * self.steps)
+            
+        elif self.decay_type == "exponential":
+            if self.current_epsilon > EPSILON_END:
+                self.current_epsilon *= self.decay_rate
+                self.current_epsilon = max(EPSILON_END, self.current_epsilon)
+                
+        elif self.decay_type == "adaptive":
+            if episode_performance is not None:
+                self.recent_performances.append(episode_performance)
+                self.performance_history.append(episode_performance)
+            
+            if self.episodes >= self.min_episodes and len(self.recent_performances) >= 50:
+                avg_performance = np.mean(list(self.recent_performances))
+                
+                # Faster decay if performing well
+                if avg_performance > self.performance_threshold:
+                    decay_rate = 0.999  # Fast decay
+                else:
+                    decay_rate = 0.9995  # Slow decay
+                
+                if self.current_epsilon > EPSILON_END:
+                    self.current_epsilon *= decay_rate
+                    self.current_epsilon = max(EPSILON_END, self.current_epsilon)
+                    
+        elif self.decay_type == "curriculum":
+            # Find current stage
+            current_stage = None
+            for stage in self.stages:
+                if self.episodes <= stage["episodes"]:
+                    current_stage = stage
+                    break
+            
+            if current_stage:
+                target_epsilon = current_stage["epsilon"]
+                # Smooth transition to target epsilon
+                if abs(self.current_epsilon - target_epsilon) > 0.01:
+                    self.current_epsilon += (target_epsilon - self.current_epsilon) * 0.01
+                else:
+                    self.current_epsilon = target_epsilon
+    
+    def get_epsilon(self):
+        return self.current_epsilon
+    
+    def get_decay_info(self):
+        """Get information about current decay state"""
+        if self.decay_type == "adaptive" and len(self.performance_history) > 0:
+            recent_avg = np.mean(list(self.recent_performances)) if self.recent_performances else 0
+            return {
+                "type": self.decay_type,
+                "epsilon": self.current_epsilon,
+                "steps": self.steps,
+                "episodes": self.episodes,
+                "recent_performance": recent_avg,
+                "performance_threshold": self.performance_threshold
+            }
+        elif self.decay_type == "curriculum":
+            current_stage = None
+            for stage in self.stages:
+                if self.episodes <= stage["episodes"]:
+                    current_stage = stage
+                    break
+            return {
+                "type": self.decay_type,
+                "epsilon": self.current_epsilon,
+                "episodes": self.episodes,
+                "current_stage": current_stage["episodes"] if current_stage else "final"
+            }
+        else:
+            return {
+                "type": self.decay_type,
+                "epsilon": self.current_epsilon,
+                "steps": self.steps
+            }
 
 # Simplified DQN Network for 23-dimensional state
 class SimpleDQN(nn.Module):
@@ -124,13 +253,13 @@ class SimpleDQNAgent:
         self.optimizer = optim.AdamW(
             self.q_network.parameters(), 
             lr=LEARNING_RATE, 
-            weight_decay=1e-4,
+            weight_decay=1e-3,  # Increased weight decay for regularization
             betas=(0.9, 0.999)
         )
         
         # Learning rate scheduler
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='max', factor=0.5, patience=1000, verbose=True
+            self.optimizer, mode='max', factor=0.7, patience=500, verbose=True, min_lr=1e-6
         )
         
         # Mixed precision training
@@ -141,7 +270,8 @@ class SimpleDQNAgent:
         
         # Training parameters
         self.memory = deque(maxlen=MEMORY_SIZE)
-        self.epsilon = EPSILON_START
+        self.epsilon_decay = SmartEpsilonDecay(decay_type=EPSILON_DECAY_TYPE)
+        self.epsilon = self.epsilon_decay.get_epsilon()
         self.steps = 0
         self.gradient_accumulation_counter = 0
         
@@ -152,8 +282,14 @@ class SimpleDQNAgent:
         self.memory.append(self.Experience(state, action, reward, next_state, done))
     
     def act(self, state, training=True):
-        if training and random.random() < self.epsilon:
-            return random.randrange(self.action_size)
+        # Use manual epsilon if set, otherwise use decayed epsilon
+        current_epsilon = MANUAL_EPSILON if MANUAL_EPSILON is not None else self.epsilon
+        
+        if training and random.random() < current_epsilon:
+            # During exploration, avoid High Card actions
+            valid_actions = list(range(self.action_size))
+            # Filter out actions that would result in High Card (this will be handled by environment)
+            return random.choice(valid_actions)
         
         with torch.no_grad():
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
@@ -187,7 +323,7 @@ class SimpleDQNAgent:
             if self.gradient_accumulation_counter % GRADIENT_ACCUMULATION_STEPS == 0:
                 # Gradient clipping
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), max_norm=0.5)  # More conservative clipping
                 
                 # Optimizer step
                 self.scaler.step(self.optimizer)
@@ -204,12 +340,14 @@ class SimpleDQNAgent:
             loss.backward()
             
             # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), max_norm=0.5)  # More conservative clipping
             self.optimizer.step()
         
-        # Update epsilon
-        if self.epsilon > EPSILON_END:
-            self.epsilon *= EPSILON_DECAY
+        # Update epsilon using smart decay (will be called with performance in training loop)
+        # Don't update here for adaptive decay - it's updated in the main training loop
+        if self.epsilon_decay.decay_type != "adaptive":
+            self.epsilon_decay.update()
+            self.epsilon = self.epsilon_decay.get_epsilon()
         
         self.steps += 1
         
@@ -226,6 +364,14 @@ class SimpleDQNAgent:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'epsilon': self.epsilon,
+            'epsilon_decay_state': {
+                'decay_type': self.epsilon_decay.decay_type,
+                'steps': self.epsilon_decay.steps,
+                'episodes': self.epsilon_decay.episodes,
+                'current_epsilon': self.epsilon_decay.current_epsilon,
+                'recent_performances': list(self.epsilon_decay.recent_performances),
+                'performance_history': self.epsilon_decay.performance_history
+            },
             'steps': self.steps,
             'scaler_state_dict': self.scaler.state_dict() if self.scaler else None
         }, filepath)
@@ -242,24 +388,37 @@ class SimpleDQNAgent:
         self.epsilon = checkpoint['epsilon']
         self.steps = checkpoint['steps']
         
+        # Load epsilon decay state if available
+        if 'epsilon_decay_state' in checkpoint:
+            decay_state = checkpoint['epsilon_decay_state']
+            self.epsilon_decay.decay_type = decay_state['decay_type']
+            self.epsilon_decay.steps = decay_state['steps']
+            self.epsilon_decay.episodes = decay_state['episodes']
+            self.epsilon_decay.current_epsilon = decay_state['current_epsilon']
+            self.epsilon_decay.recent_performances = deque(decay_state['recent_performances'], maxlen=100)
+            self.epsilon_decay.performance_history = decay_state['performance_history']
+        
         if 'scaler_state_dict' in checkpoint and checkpoint['scaler_state_dict'] and self.scaler:
             self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
 
 def evaluate_agent(agent, env, episodes=100):
-    """Evaluate agent performance"""
+    """Evaluate agent performance (with timeout protection)"""
     wins = 0
     total_scores = []
     total_rewards = []
     
-    for _ in range(episodes):
+    for episode in range(episodes):
         obs, _ = env.reset()
         episode_reward = 0
         done = False
+        step_count = 0
+        max_steps = 50  # Prevent infinite loops
         
-        while not done:
+        while not done and step_count < max_steps:
             action = agent.act(obs, training=False)
             obs, reward, done, truncated, info = env.step(action)
             episode_reward += reward
+            step_count += 1
         
         if info.get('won', False):
             wins += 1
@@ -276,21 +435,15 @@ def main():
     print("🎰 Training Simplified Balatro DQN Agent (GPU/TPU Optimized)")
     print("=" * 50)
     
-    # Setup MLflow
-    mlflow_tracker = MLflowTracker(
-        experiment_name="balatro_simple_dqn"
-    )
-    mlflow_tracker.start_run(run_name=f"simple_dqn_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-    
     # Setup environment and agent
-    env = BalatroGymEnvSimple(blind_score=300)
+    env = BalatroGymEnvSimple(blind_score=1500)  # Increased score requirement for 10 plays
     state_size = env.observation_space.shape[0]
     action_size = env.action_space.n
     
     print(f"State size: {state_size}")
     print(f"Action size: {action_size}")
     print(f"Learning rate: {LEARNING_RATE}")
-    print(f"Epsilon decay: {EPSILON_DECAY}")
+    print(f"Epsilon decay type: {EPSILON_DECAY_TYPE}")
     print(f"Batch size: {BATCH_SIZE}")
     print(f"Memory size: {MEMORY_SIZE}")
     
@@ -327,8 +480,7 @@ def main():
     
     # Setup plotting
     plotter = TrainingPlotter(
-        save_dir="training_plots_simple",
-        mlflow_tracker=mlflow_tracker
+        save_dir="training_plots_simple"
     )
     
     # Training loop
@@ -337,6 +489,14 @@ def main():
     episode_wins = []
     episode_lengths = []
     losses = []
+    
+    # Track hand types for analysis
+    episode_hand_types = []  # Store hand types for each episode
+    hand_type_counts = {
+        "High Card": 0, "Pair": 0, "Two Pair": 0, "Three of a Kind": 0,
+        "Straight": 0, "Flush": 0, "Full House": 0, "Four of a Kind": 0,
+        "Straight Flush": 0, "Royal Flush": 0
+    }
     
     best_win_rate = 0.0
     start_time = time.time()
@@ -348,6 +508,7 @@ def main():
         obs, _ = env.reset()
         episode_reward = 0
         episode_length = 0
+        episode_hands = []  # Track hands played in this episode
         done = False
         
         while not done:
@@ -364,54 +525,98 @@ def main():
                 loss = agent.replay(BATCH_SIZE)
                 if loss is not None:
                     losses.append(loss)
+            
+            # Track hand type if this was a play action
+            if info.get('action_type') == 'play' and 'hand_type' in info:
+                episode_hands.append(info['hand_type'])
         
         # Record episode data
         episode_rewards.append(episode_reward)
         episode_scores.append(info.get('total_score', 0))
         episode_wins.append(1 if info.get('won', False) else 0)
         episode_lengths.append(episode_length)
+        episode_hand_types.append(episode_hands)
         
-        # Log to MLflow
-        mlflow_tracker.log_custom_metric('episode_reward', episode_reward, step=episode)
-        mlflow_tracker.log_custom_metric('episode_score', info.get('total_score', 0), step=episode)
-        mlflow_tracker.log_custom_metric('episode_won', 1 if info.get('won', False) else 0, step=episode)
-        mlflow_tracker.log_custom_metric('episode_length', episode_length, step=episode)
-        mlflow_tracker.log_custom_metric('epsilon', agent.epsilon, step=episode)
-        mlflow_tracker.log_custom_metric('memory_size', len(agent.memory), step=episode)
+        # Update global hand type counts
+        for hand_type in episode_hands:
+            if hand_type in hand_type_counts:
+                hand_type_counts[hand_type] += 1
+        
+        # Update epsilon decay with episode performance (for adaptive decay)
+        # Only update if not using manual epsilon
+        if MANUAL_EPSILON is None:
+            episode_performance = 1 if info.get('won', False) else 0  # Win rate as performance metric
+            agent.epsilon_decay.episodes = episode
+            agent.epsilon_decay.update(episode_performance=episode_performance)
+            agent.epsilon = agent.epsilon_decay.get_epsilon()
+        else:
+            # Use manual epsilon
+            agent.epsilon = MANUAL_EPSILON
+        
+
         
         # Print progress
         if episode % 100 == 0:
             recent_rewards = episode_rewards[-100:]
             recent_wins = episode_wins[-100:]
             recent_scores = episode_scores[-100:]
+            recent_hand_types = episode_hand_types[-100:] if episode_hand_types else []
             
             avg_reward = np.mean(recent_rewards)
             win_rate = np.mean(recent_wins)
             avg_score = np.mean(recent_scores)
             
+            # Calculate hand type statistics for recent episodes
+            recent_hand_counts = {}
+            for hand_list in recent_hand_types:
+                for hand_type in hand_list:
+                    recent_hand_counts[hand_type] = recent_hand_counts.get(hand_type, 0) + 1
+            
+            # Get most common hand types
+            if recent_hand_counts:
+                sorted_hands = sorted(recent_hand_counts.items(), key=lambda x: x[1], reverse=True)
+                top_hands = [f"{hand}:{count}" for hand, count in sorted_hands[:3]]
+                hand_summary = ", ".join(top_hands)
+            else:
+                hand_summary = "No hands played"
+            
             elapsed_time = time.time() - start_time
             episodes_per_sec = episode / elapsed_time
+            
+            # Get current epsilon (manual or decayed)
+            current_epsilon = MANUAL_EPSILON if MANUAL_EPSILON is not None else agent.epsilon
             
             print(f"Episode {episode:5d} | "
                   f"Avg Reward: {avg_reward:6.2f} | "
                   f"Win Rate: {win_rate:5.1%} | "
                   f"Avg Score: {avg_score:6.1f} | "
-                  f"Epsilon: {agent.epsilon:.3f} | "
+                  f"Epsilon: {current_epsilon:.3f} | "
                   f"Speed: {episodes_per_sec:.1f} ep/s")
+            print(f"  Recent Hands: {hand_summary}")
+        
+        # More frequent epsilon logging for debugging
+        # if episode % 100 == 0:
+        #     decay_info = agent.epsilon_decay.get_decay_info()
+        #     epsilon_status = "MIN" if agent.epsilon <= EPSILON_END else "DECAYING"
+        #     decay_progress = ((1.0 - agent.epsilon) / (1.0 - EPSILON_END)) * 100 if agent.epsilon > EPSILON_END else 100
+            
+        #     if decay_info["type"] == "adaptive":
+        #         print(f"  Epsilon: {agent.epsilon:.4f} ({epsilon_status}) - Type: {decay_info['type']} - Recent Performance: {decay_info['recent_performance']:.3f}")
+        #     elif decay_info["type"] == "curriculum":
+        #         print(f"  Epsilon: {agent.epsilon:.4f} ({epsilon_status}) - Type: {decay_info['type']} - Stage: {decay_info['current_stage']}")
+        #     else:
+        #         print(f"  Epsilon: {agent.epsilon:.4f} ({epsilon_status}) - Type: {decay_info['type']} - Steps: {decay_info['steps']} - Decay: {decay_progress:.1f}%")
         
         # Evaluation
         if episode % EVAL_INTERVAL == 0:
-            win_rate, avg_score, avg_reward = evaluate_agent(agent, env, episodes=50)
+            win_rate, avg_score, avg_reward = evaluate_agent(agent, env, episodes=25)  # Reduced evaluation episodes
             
             print(f"\n📊 Evaluation at Episode {episode}:")
             print(f"   Win Rate: {win_rate:.1%}")
             print(f"   Avg Score: {avg_score:.1f}")
             print(f"   Avg Reward: {avg_reward:.2f}")
             
-            # Log evaluation metrics
-            mlflow_tracker.log_custom_metric('eval_win_rate', win_rate, step=episode)
-            mlflow_tracker.log_custom_metric('eval_avg_score', avg_score, step=episode)
-            mlflow_tracker.log_custom_metric('eval_avg_reward', avg_reward, step=episode)
+
             
             # Save best model
             if win_rate > best_win_rate:
@@ -419,7 +624,6 @@ def main():
                 model_path = os.path.join("weights", "best_simple_model.pth")
                 os.makedirs("weights", exist_ok=True)
                 agent.save(model_path)
-                mlflow_tracker.log_artifact(model_path, "models")
                 print(f"   🏆 New best model saved! Win rate: {win_rate:.1%}")
                 
                 # Update learning rate scheduler
@@ -439,58 +643,32 @@ def main():
             
             plotter.plot_training_progress(episode)
         
-        # Diagnostics
-        if episode % DIAGNOSTICS_INTERVAL == 0:
-            # Run diagnostics
-            recent_episodes = 1000
-            if len(episode_rewards) >= recent_episodes:
-                recent_rewards = episode_rewards[-recent_episodes:]
-                recent_scores = episode_scores[-recent_episodes:]
-                recent_wins = episode_wins[-recent_episodes:]
-                
-                # Calculate trends
-                reward_trend = np.polyfit(range(len(recent_rewards)), recent_rewards, 1)[0]
-                score_trend = np.polyfit(range(len(recent_scores)), recent_scores, 1)[0]
-                
-                print(f"\n🔍 Training Diagnostics Report - Episode {episode}")
-                print("=" * 60)
-                print(f"📈 Learning Progress:")
-                print(f"   Reward trend: {reward_trend:.4f} {'✅' if reward_trend > 0 else '❌'}")
-                print(f"   Score trend: {score_trend:.4f} {'✅' if score_trend > 0 else '❌'}")
-                print(f"   Exploration decreasing: {'✅' if agent.epsilon < 0.5 else '❌'}")
-                print(f"   Average reward: {np.mean(recent_rewards):.2f}")
-                print(f"   Average score: {np.mean(recent_scores):.2f}")
-                
-                print(f"\n🎯 Performance Analysis:")
-                print(f"   Win rate: {np.mean(recent_wins):.1%}")
-                print(f"   Score range: {min(recent_scores)} - {max(recent_scores)}")
-                print(f"   Score variance: {np.var(recent_scores):.2f}")
-                
-                # Recommendations
-                print(f"\n💡 Recommendations:")
-                if reward_trend < 0:
-                    print("   1. ⚠️ Rewards decreasing - consider reducing learning rate further")
-                if np.mean(recent_scores) < 200:
-                    print("   2. 🎯 Low scores - consider improving reward shaping")
-                if agent.epsilon > 0.3:
-                    print("   3. 🔍 High exploration - training may need more episodes")
-                if np.var(recent_scores) > 5000:
-                    print("   4. 📊 High variance - consider stabilizing training")
+        # Diagnostics removed for faster training
     
     # Final evaluation and save
     total_time = time.time() - start_time
     print(f"\n🎯 Final Evaluation:")
-    win_rate, avg_score, avg_reward = evaluate_agent(agent, env, episodes=100)
+    win_rate, avg_score, avg_reward = evaluate_agent(agent, env, episodes=50)  # Reduced final evaluation episodes
     print(f"   Final Win Rate: {win_rate:.1%}")
     print(f"   Final Avg Score: {avg_score:.1f}")
     print(f"   Final Avg Reward: {avg_reward:.2f}")
     print(f"   Total Training Time: {total_time/3600:.1f} hours")
     print(f"   Average Speed: {TRAINING_EPISODES/total_time:.1f} episodes/second")
     
+    # Print hand type statistics
+    print(f"\n🃏 Hand Type Statistics (All Training):")
+    total_hands = sum(hand_type_counts.values())
+    if total_hands > 0:
+        sorted_hands = sorted(hand_type_counts.items(), key=lambda x: x[1], reverse=True)
+        for hand_type, count in sorted_hands:
+            percentage = (count / total_hands) * 100
+            print(f"   {hand_type:15s}: {count:4d} ({percentage:5.1f}%)")
+    else:
+        print("   No hands played during training")
+    
     # Save final model
     final_model_path = os.path.join("weights", "final_simple_model.pth")
     agent.save(final_model_path)
-    mlflow_tracker.log_artifact(final_model_path, "models")
     
     # Final plots
     plotter.add_data_point(TRAINING_EPISODES, {
@@ -508,7 +686,6 @@ def main():
     print(f"\n✅ Training completed!")
     print(f"📁 Models saved to: weights/")
     print(f"📊 Plots saved to: training_plots_simple/")
-    print(f"📈 MLflow experiment: {mlflow_tracker.experiment_name}")
     print(f"⚡ Performance: {TRAINING_EPISODES/total_time:.1f} episodes/second")
     if GPU_AVAILABLE:
         print(f"🎮 GPU Memory Used: {torch.cuda.max_memory_allocated()/1e9:.1f} GB")
