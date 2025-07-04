@@ -38,6 +38,14 @@ class MLflowTracker:
         # Track episode rewards for average calculation
         self.episode_rewards_history = []
         
+        # Running averages tracking
+        self.running_averages = {
+            "rewards": [],
+            "lengths": [],
+            "q_values": [],
+            "losses": []
+        }
+        
         # Set up MLflow
         self.setup_mlflow()
         
@@ -164,6 +172,9 @@ class MLflowTracker:
         # Track episode reward history
         self.episode_rewards_history.append(self.current_episode_reward)
         
+        # Log running averages
+        self.log_running_averages(agent, avg_q_value, self.current_episode_length)
+        
         # Check for new records
         is_best_episode = self.current_episode_reward > self.best_episode_reward
         is_best_average = False
@@ -202,6 +213,61 @@ class MLflowTracker:
         # Create and log plots every 5 episodes
         if self.episode_count % 5 == 0:
             self.create_and_log_plots()
+    
+    def calculate_running_averages(self, window_sizes: List[int] = [5, 10, 20, 50]):
+        """Calculate running averages for different window sizes"""
+        if self.current_run is None:
+            return
+        
+        # Calculate running averages for rewards
+        for window in window_sizes:
+            if len(self.episode_rewards_history) >= window:
+                recent_rewards = self.episode_rewards_history[-window:]
+                avg_reward = np.mean(recent_rewards)
+                mlflow.log_metric(f"running_avg_reward_{window}", avg_reward, step=self.episode_count)
+                
+                # Store in running averages for plotting
+                if f"reward_{window}" not in self.running_averages["rewards"]:
+                    self.running_averages["rewards"].append(f"reward_{window}")
+                    self.running_averages["rewards"].append([])
+                self.running_averages["rewards"][-1].append(avg_reward)
+    
+    def log_running_averages(self, agent, avg_q_value: float, episode_length: int):
+        """Log running averages for current episode"""
+        if self.current_run is None:
+            return
+        
+        # Calculate running averages with different window sizes
+        self.calculate_running_averages()
+        
+        # Log episode-specific running averages
+        if len(self.episode_rewards_history) > 0:
+            # All-time average
+            all_time_avg = np.mean(self.episode_rewards_history)
+            mlflow.log_metric("all_time_avg_reward", all_time_avg, step=self.episode_count)
+            
+            # Recent trend (last 5 vs previous 5)
+            if len(self.episode_rewards_history) >= 10:
+                recent_5 = np.mean(self.episode_rewards_history[-5:])
+                previous_5 = np.mean(self.episode_rewards_history[-10:-5])
+                trend = recent_5 - previous_5
+                mlflow.log_metric("reward_trend_5_episodes", trend, step=self.episode_count)
+        
+        # Log other running averages
+        if len(agent.training_loss) > 0:
+            recent_losses = agent.training_loss[-min(50, len(agent.training_loss)):]
+            avg_loss = np.mean(recent_losses)
+            mlflow.log_metric("running_avg_loss", avg_loss, step=self.episode_count)
+        
+        # Log episode length trend
+        if len(self.running_averages["lengths"]) > 0:
+            recent_lengths = self.running_averages["lengths"][-min(10, len(self.running_averages["lengths"])):]
+            avg_length = np.mean(recent_lengths)
+            mlflow.log_metric("running_avg_episode_length", avg_length, step=self.episode_count)
+        
+        # Store current episode data for future averages
+        self.running_averages["lengths"].append(episode_length)
+        self.running_averages["q_values"].append(avg_q_value)
     
     def save_best_model(self, agent, is_best_episode: bool, is_best_average: bool):
         """Save model when best performance is achieved"""
@@ -242,16 +308,20 @@ class MLflowTracker:
             fig, axes = plt.subplots(2, 2, figsize=(15, 10))
             fig.suptitle(f"Performance Overview - Episode {self.episode_count}", fontsize=16)
             
-            # Plot 1: Episode Rewards
+            # Plot 1: Episode Rewards with Running Averages
             episodes = list(range(1, len(self.episode_rewards_history) + 1))
             axes[0, 0].plot(episodes, self.episode_rewards_history, 'b-', alpha=0.7, label='Episode Reward')
             
-            # Add moving average if we have enough data
-            if len(self.episode_rewards_history) >= 5:
-                window = min(5, len(self.episode_rewards_history) // 2)
-                moving_avg = np.convolve(self.episode_rewards_history, np.ones(window)/window, mode='valid')
-                avg_episodes = episodes[window-1:]
-                axes[0, 0].plot(avg_episodes, moving_avg, 'r-', linewidth=2, label=f'{window}-Episode Average')
+            # Add multiple running averages if we have enough data
+            colors = ['r-', 'g-', 'orange', 'purple']
+            window_sizes = [5, 10, 20, 50]
+            
+            for i, window in enumerate(window_sizes):
+                if len(self.episode_rewards_history) >= window:
+                    moving_avg = np.convolve(self.episode_rewards_history, np.ones(window)/window, mode='valid')
+                    avg_episodes = episodes[window-1:]
+                    axes[0, 0].plot(avg_episodes, moving_avg, colors[i], linewidth=2, 
+                                   label=f'{window}-Episode Average')
             
             axes[0, 0].set_title("Episode Rewards")
             axes[0, 0].set_xlabel("Episode")
@@ -275,21 +345,41 @@ class MLflowTracker:
             axes[1, 0].set_ylabel("Reward")
             axes[1, 0].grid(True, alpha=0.3)
             
-            # Plot 4: Performance Statistics
-            if len(self.episode_rewards_history) > 0:
-                stats_text = f"""
+            # Plot 4: Running Averages Comparison
+            if len(self.episode_rewards_history) >= 5:
+                # Get the most recent running averages
+                recent_episodes = episodes[-min(50, len(episodes)):]
+                recent_rewards = self.episode_rewards_history[-min(50, len(self.episode_rewards_history)):]
+                
+                # Calculate running averages for the recent period
+                for i, window in enumerate(window_sizes):
+                    if len(recent_rewards) >= window:
+                        moving_avg = np.convolve(recent_rewards, np.ones(window)/window, mode='valid')
+                        avg_episodes = recent_episodes[window-1:]
+                        axes[1, 1].plot(avg_episodes, moving_avg, colors[i], linewidth=2, 
+                                       label=f'{window}-Episode Avg')
+                
+                axes[1, 1].set_title("Running Averages Comparison (Recent 50 Episodes)")
+                axes[1, 1].set_xlabel("Episode")
+                axes[1, 1].set_ylabel("Average Reward")
+                axes[1, 1].legend()
+                axes[1, 1].grid(True, alpha=0.3)
+            else:
+                # Fallback to statistics if not enough data
+                if len(self.episode_rewards_history) > 0:
+                    stats_text = f"""
 Total Episodes: {self.episode_count}
 Current Reward: {self.episode_rewards_history[-1]:.2f}
 Average Reward: {np.mean(self.episode_rewards_history):.2f}
 Best Reward: {self.best_episode_reward:.2f}
 Best 10-Ep Avg: {self.best_average_reward:.2f}
 Standard Deviation: {np.std(self.episode_rewards_history):.2f}
-                """
-                axes[1, 1].text(0.1, 0.9, stats_text, transform=axes[1, 1].transAxes, 
-                               fontsize=10, verticalalignment='top', fontfamily='monospace')
-                axes[1, 1].set_title("Performance Statistics")
-                axes[1, 1].set_xticks([])
-                axes[1, 1].set_yticks([])
+                    """
+                    axes[1, 1].text(0.1, 0.9, stats_text, transform=axes[1, 1].transAxes, 
+                                   fontsize=10, verticalalignment='top', fontfamily='monospace')
+                    axes[1, 1].set_title("Performance Statistics")
+                    axes[1, 1].set_xticks([])
+                    axes[1, 1].set_yticks([])
             
             plt.tight_layout()
             

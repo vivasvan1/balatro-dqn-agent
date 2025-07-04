@@ -166,10 +166,11 @@ class DQNAgent:
         """Decrease epsilon."""
         self.epsilon = max(self.final_epsilon, self.epsilon * self.epsilon_decay)
     
-    # def save(self, filename):
-    #     """Save the weights of the local Q-network."""
-    #     torch.save(self.qnetwork_local.state_dict(), filename+'_local.pth')
-    #     torch.save(self.qnetwork_target.state_dict(), filename+'_target.pth')
+    def save(self, filename):
+        """Save the weights of the local Q-network."""
+        torch.save(self.qnetwork_local.state_dict(), filename+'_local.pth')
+        torch.save(self.qnetwork_target.state_dict(), filename+'_target.pth')
+    
     def load(self, filename):
         """Load weights into the local Q-network."""
         self.qnetwork_local.load_state_dict(torch.load(filename+"_local.pth", weights_only=True))
