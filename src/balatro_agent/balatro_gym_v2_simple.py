@@ -217,39 +217,64 @@ class BalatroGymEnvSimple(gym.Env):
         return len(card_indices)
     
     def _calculate_reward(self, action_type: str, result: Any) -> float:
-        """Calculate reward with improved shaping"""
-        if self.game_over:
-            if self.won:
-                return 200.0  # Increased win reward
-            else:
-                return -100.0  # Increased loss penalty
-        
+        """Calculate reward with strategic shaping for optimal play vs discard decisions"""
         if action_type == "play":
             score_gained, hand_type = result
             
-            # Base reward (increased)
-            reward = score_gained / 5.0  # More reward per point
+            # Base reward from score gained
+            reward = score_gained / 25.0
             
-            # Progress bonus - encourage getting closer to target
-            progress_bonus = (self.current_score / self.blind_score) * 50  # Increased
-            reward += progress_bonus
-            
-            # Hand quality bonus (increased)
+            # Hand quality bonus
             hand_bonuses = {
                 "Royal Flush": 100, "Straight Flush": 60, "Four of a Kind": 40,
                 "Full House": 30, "Flush": 20, "Straight": 15,
-                "Three of a Kind": 10, "Two Pair": 6, "Pair": 3, "High Card": 0
+                "Three of a Kind": 10, "Two Pair": 6, "Pair": 2, "High Card": -5
             }
             reward += hand_bonuses.get(hand_type, 0)
             
-            # Efficiency bonus - reward for using fewer cards effectively
-            if score_gained > 50:  # Good score
-                reward += 10.0
+            # Strategic penalty for playing weak hands when discards are available
+            if hand_type in ["High Card", "Pair"] and score_gained < 15 and self.discards_left > 0:
+                reward -= 15.0  # Strong penalty for playing weak hands when could discard
+            
+            # Bonus for good plays when close to target
+            if self.current_score / self.blind_score > 0.7 and score_gained > 20:
+                reward += 10.0  # Bonus for good plays when close to winning
             
             return reward
         
         elif action_type == "discard":
-            return -2.0  # Slightly increased discard penalty
+            # Base reward for discarding
+            reward = 8.0
+            
+            # Calculate best possible hand from current cards
+            if hasattr(self, 'hand') and self.hand:
+                from itertools import combinations
+                max_score = 0
+                best_hand_type = "High Card"
+                
+                for r in range(1, min(6, len(self.hand) + 1)):
+                    for combo in combinations(self.hand, r):
+                        from balatro_gym_v2 import BalatroHand
+                        balatro_hand = BalatroHand(list(combo))
+                        hand_type, base_chips, multiplier, card_chips = balatro_hand.evaluate_hand()
+                        total_score = (base_chips + card_chips) * multiplier
+                        if total_score > max_score:
+                            max_score = total_score
+                            best_hand_type = hand_type
+                
+                # Smart discard bonuses based on hand quality
+                if best_hand_type in ["High Card", "Pair"] and max_score < 25:
+                    reward += 20.0  # Strong bonus for discarding bad hands
+                elif best_hand_type in ["Two Pair", "Three of a Kind"] and max_score < 40:
+                    reward += 10.0  # Moderate bonus for discarding mediocre hands
+                else:
+                    reward -= 5.0  # Small penalty for discarding good hands
+            
+            # Bonus for strategic discarding (when plays are limited)
+            if self.plays_left <= 1 and self.discards_left > 1:
+                reward += 15.0  # Bonus for discarding when plays are scarce
+            
+            return reward
         
         return 0.0
     
@@ -309,16 +334,34 @@ class BalatroGymEnvSimple(gym.Env):
         
         # Calculate reward
         reward = self._calculate_reward(action_type, result)
+        # print(f"Reward: {reward}, Action Type: {action_type}, Result: {result}")
         
         # Check game end conditions
         if self.current_score >= self.blind_score:
             self.game_over = True
             self.won = True
-            reward += 100.0
+            reward += 50.0  # Bonus for winning
         elif self.plays_left <= 0:
             self.game_over = True
             self.won = False
-            reward -= 100.0  # Severe penalty for running out of plays
+            reward -= 20.0  # Penalty for running out of plays
+        elif self.discards_left <= 0:
+            # Penalty for running out of discards (encourages strategic discarding)
+            reward -= 15.0
+            # Additional penalty if we still have weak hands and no discards left
+            if hasattr(self, 'hand') and self.hand:
+                from itertools import combinations
+                max_score = 0
+                for r in range(1, min(6, len(self.hand) + 1)):
+                    for combo in combinations(self.hand, r):
+                        from balatro_gym_v2 import BalatroHand
+                        balatro_hand = BalatroHand(list(combo))
+                        hand_type, base_chips, multiplier, card_chips = balatro_hand.evaluate_hand()
+                        total_score = (base_chips + card_chips) * multiplier
+                        max_score = max(max_score, total_score)
+                
+                if max_score < 30:
+                    reward -= 10.0  # Extra penalty for running out of discards with bad hands
         
         info.update({
             "plays_left": self.plays_left,

@@ -153,27 +153,40 @@ def evaluate_agent(agent, env, episodes=100):
     wins = 0
     total_scores = []
     total_rewards = []
+    evaluation_hand_types = []
     
     for _ in range(episodes):
         obs, _ = env.reset()
         episode_reward = 0
+        episode_hand_types = []
         done = False
         
         while not done:
             action = agent.act(obs, training=False)
             obs, reward, done, truncated, info = env.step(action)
+            
+            # Track hand types if a hand was played
+            if info.get('action_type') == 'play' and 'hand_type' in info:
+                episode_hand_types.append(info['hand_type'])
+            
             episode_reward += reward
         
         if info.get('won', False):
             wins += 1
         total_scores.append(info.get('total_score', 0))
         total_rewards.append(episode_reward)
+        evaluation_hand_types.extend(episode_hand_types)
     
     win_rate = wins / episodes
     avg_score = np.mean(total_scores)
     avg_reward = np.mean(total_rewards)
     
-    return win_rate, avg_score, avg_reward
+    # Count hand types in evaluation
+    hand_counts = {}
+    for hand_type in evaluation_hand_types:
+        hand_counts[hand_type] = hand_counts.get(hand_type, 0) + 1
+    
+    return win_rate, avg_score, avg_reward, hand_counts
 
 def main():
     print("🎰 Training Simplified Balatro DQN Agent")
@@ -227,6 +240,10 @@ def main():
     episode_lengths = []
     losses = []
     
+    # Track hand types played in recent episodes
+    recent_hand_types = deque(maxlen=100)  # Keep last 100 episodes
+    episode_hand_types = []  # Track hand types for current episode
+    
     best_win_rate = 0.0
     
     print(f"\n🚀 Starting training for {TRAINING_EPISODES} episodes...")
@@ -236,11 +253,16 @@ def main():
         obs, _ = env.reset()
         episode_reward = 0
         episode_length = 0
+        episode_hand_types = []  # Reset hand types for new episode
         done = False
         
         while not done:
             action = agent.act(obs, training=True)
             next_obs, reward, done, truncated, info = env.step(action)
+            
+            # Track hand types if a hand was played
+            if info.get('action_type') == 'play' and 'hand_type' in info:
+                episode_hand_types.append(info['hand_type'])
             
             agent.remember(obs, action, reward, next_obs, done)
             obs = next_obs
@@ -258,6 +280,9 @@ def main():
         episode_scores.append(info.get('total_score', 0))
         episode_wins.append(1 if info.get('won', False) else 0)
         episode_lengths.append(episode_length)
+        
+        # Record hand types for this episode
+        recent_hand_types.append(episode_hand_types)
         
         # Log to MLflow
         mlflow_tracker.log_custom_metric('episode_reward', episode_reward, step=episode)
@@ -282,15 +307,37 @@ def main():
                   f"Win Rate: {win_rate:5.1%} | "
                   f"Avg Score: {avg_score:6.1f} | "
                   f"Epsilon: {agent.epsilon:.3f}")
+            
+            # Display hand types from last 100 episodes
+            if recent_hand_types:
+                # Flatten all hand types from recent episodes
+                all_recent_hands = []
+                for episode_hands in recent_hand_types:
+                    all_recent_hands.extend(episode_hands)
+                
+                # Count hand types
+                hand_counts = {}
+                for hand_type in all_recent_hands:
+                    hand_counts[hand_type] = hand_counts.get(hand_type, 0) + 1
+                
+                # Display hand type distribution
+                if hand_counts:
+                    print(f"  Recent Hands: " + " | ".join([f"{hand}:{count}" for hand, count in sorted(hand_counts.items())]))
+                else:
+                    print(f"  Recent Hands: No hands played")
         
         # Evaluation
         if episode % EVAL_INTERVAL == 0:
-            win_rate, avg_score, avg_reward = evaluate_agent(agent, env, episodes=50)
+            win_rate, avg_score, avg_reward, eval_hand_counts = evaluate_agent(agent, env, episodes=50)
             
             print(f"\n📊 Evaluation at Episode {episode}:")
             print(f"   Win Rate: {win_rate:.1%}")
             print(f"   Avg Score: {avg_score:.1f}")
             print(f"   Avg Reward: {avg_reward:.2f}")
+            
+            # Display evaluation hand types
+            if eval_hand_counts:
+                print(f"   Eval Hands: " + " | ".join([f"{hand}:{count}" for hand, count in sorted(eval_hand_counts.items())]))
             
             # Log evaluation metrics
             mlflow_tracker.log_custom_metric('eval_win_rate', win_rate, step=episode)
@@ -360,10 +407,14 @@ def main():
     
     # Final evaluation and save
     print(f"\n🎯 Final Evaluation:")
-    win_rate, avg_score, avg_reward = evaluate_agent(agent, env, episodes=100)
+    win_rate, avg_score, avg_reward, final_hand_counts = evaluate_agent(agent, env, episodes=100)
     print(f"   Final Win Rate: {win_rate:.1%}")
     print(f"   Final Avg Score: {avg_score:.1f}")
     print(f"   Final Avg Reward: {avg_reward:.2f}")
+    
+    # Display final hand type distribution
+    if final_hand_counts:
+        print(f"   Final Hands: " + " | ".join([f"{hand}:{count}" for hand, count in sorted(final_hand_counts.items())]))
     
     # Save final model
     final_model_path = os.path.join("weights", "final_simple_model.pth")
