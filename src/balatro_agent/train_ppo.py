@@ -101,6 +101,19 @@ class ComprehensivePPOTrainer:
         timesteps_so_far = 0
         start_time = time.time()
         
+        # Initial evaluation
+        print("\n📊 Initial Evaluation:")
+        initial_eval_stats = self.evaluate(num_eval_episodes)
+        self.training_stats['episode_rewards'].append(initial_eval_stats['avg_reward'])
+        self.training_stats['episode_lengths'].append(initial_eval_stats['avg_length'])
+        self.training_stats['win_rates'].append(initial_eval_stats['win_rate'])
+        self.training_stats['action_distributions'].append(initial_eval_stats['action_distribution'])
+        print(f"  Average Reward: {initial_eval_stats['avg_reward']:.2f} \u00b1 {initial_eval_stats['std_reward']:.2f}")
+        print(f"  Win Rate: {initial_eval_stats['win_rate']:.2%}")
+        print(f"  Average Length: {initial_eval_stats['avg_length']:.1f}")
+        print(f"  Action Distribution: {initial_eval_stats['action_distribution']}")
+        print("-" * 40)
+        
         with tqdm(total=total_timesteps, desc="Training Progress") as pbar:
             while timesteps_so_far < total_timesteps:
                 # Collect batch
@@ -120,8 +133,13 @@ class ComprehensivePPOTrainer:
                 if timesteps_so_far % debug_interval == 0:
                     self._debug_training_step(update_stats, buffer)
                 
-                # Evaluation
-                if timesteps_so_far % eval_interval == 0:
+                # Evaluation - do it more frequently for short training runs
+                should_evaluate = (
+                    timesteps_so_far % eval_interval == 0 or 
+                    len(self.training_stats['policy_losses']) % 5 == 0  # Every 5 updates
+                )
+                
+                if should_evaluate:
                     eval_stats = self.evaluate(num_eval_episodes)
                     self.training_stats['episode_rewards'].append(eval_stats['avg_reward'])
                     self.training_stats['episode_lengths'].append(eval_stats['avg_length'])
@@ -162,6 +180,19 @@ class ComprehensivePPOTrainer:
                 })
         
         training_time = time.time() - start_time
+        
+        # Final evaluation
+        print("\n📊 Final Evaluation:")
+        final_eval_stats = self.evaluate(num_eval_episodes)
+        self.training_stats['episode_rewards'].append(final_eval_stats['avg_reward'])
+        self.training_stats['episode_lengths'].append(final_eval_stats['avg_length'])
+        self.training_stats['win_rates'].append(final_eval_stats['win_rate'])
+        self.training_stats['action_distributions'].append(final_eval_stats['action_distribution'])
+        print(f"  Average Reward: {final_eval_stats['avg_reward']:.2f} ± {final_eval_stats['std_reward']:.2f}")
+        print(f"  Win Rate: {final_eval_stats['win_rate']:.2%}")
+        print(f"  Average Length: {final_eval_stats['avg_length']:.1f}")
+        print(f"  Action Distribution: {final_eval_stats['action_distribution']}")
+        print("-" * 40)
         
         # Final save and evaluation
         self.agent.save_model("ppo_balatro_final.pth")
@@ -307,28 +338,37 @@ class ComprehensivePPOTrainer:
         
         # Episode rewards
         if self.training_stats['episode_rewards']:
-            axes[0, 0].plot(self.training_stats['episode_rewards'], 'b-', linewidth=2)
+            axes[0, 0].plot(self.training_stats['episode_rewards'], 'b-', linewidth=2, marker='o')
             axes[0, 0].set_title('Episode Rewards', fontsize=14, fontweight='bold')
             axes[0, 0].set_xlabel('Evaluation Step')
             axes[0, 0].set_ylabel('Average Reward')
             axes[0, 0].grid(True, alpha=0.3)
+        else:
+            axes[0, 0].text(0.5, 0.5, 'No evaluation data yet', ha='center', va='center', transform=axes[0, 0].transAxes, fontsize=12)
+            axes[0, 0].set_title('Episode Rewards', fontsize=14, fontweight='bold')
         
         # Win rate
         if self.training_stats['win_rates']:
-            axes[0, 1].plot(self.training_stats['win_rates'], 'g-', linewidth=2)
+            axes[0, 1].plot(self.training_stats['win_rates'], 'g-', linewidth=2, marker='o')
             axes[0, 1].set_title('Win Rate', fontsize=14, fontweight='bold')
             axes[0, 1].set_xlabel('Evaluation Step')
             axes[0, 1].set_ylabel('Win Rate')
             axes[0, 1].grid(True, alpha=0.3)
             axes[0, 1].set_ylim(0, 1)
+        else:
+            axes[0, 1].text(0.5, 0.5, 'No evaluation data yet', ha='center', va='center', transform=axes[0, 1].transAxes, fontsize=12)
+            axes[0, 1].set_title('Win Rate', fontsize=14, fontweight='bold')
         
         # Episode lengths
         if self.training_stats['episode_lengths']:
-            axes[0, 2].plot(self.training_stats['episode_lengths'], 'r-', linewidth=2)
+            axes[0, 2].plot(self.training_stats['episode_lengths'], 'r-', linewidth=2, marker='o')
             axes[0, 2].set_title('Episode Lengths', fontsize=14, fontweight='bold')
             axes[0, 2].set_xlabel('Evaluation Step')
             axes[0, 2].set_ylabel('Average Length')
             axes[0, 2].grid(True, alpha=0.3)
+        else:
+            axes[0, 2].text(0.5, 0.5, 'No evaluation data yet', ha='center', va='center', transform=axes[0, 2].transAxes, fontsize=12)
+            axes[0, 2].set_title('Episode Lengths', fontsize=14, fontweight='bold')
         
         # Policy loss
         if self.training_stats['policy_losses']:
@@ -469,6 +509,10 @@ class ComprehensivePPOTrainer:
         plt.tight_layout()
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"📊 Training curves saved to {save_path}")
+        print(f"   Episode rewards data points: {len(self.training_stats['episode_rewards'])}")
+        print(f"   Win rates data points: {len(self.training_stats['win_rates'])}")
+        print(f"   Episode lengths data points: {len(self.training_stats['episode_lengths'])}")
+        print(f"   Policy losses data points: {len(self.training_stats['policy_losses'])}")
         plt.show()
 
 def main():
