@@ -185,21 +185,21 @@ class SmartEpsilonDecay:
                 "steps": self.steps
             }
 
-# Simplified DQN Network for 23-dimensional state
+# Simplified DQN Network for 17-dimensional state
 class SimpleDQN(nn.Module):
     def __init__(self, state_size: int, action_size: int):
         super(SimpleDQN, self).__init__()
         
         # Optimized network for GPU/TPU
-        self.fc1 = nn.Linear(state_size, 256)  # Increased for better GPU utilization
-        self.fc2 = nn.Linear(256, 256)         # Increased for better GPU utilization
-        self.fc3 = nn.Linear(256, 128)         # Increased for better GPU utilization
-        self.fc4 = nn.Linear(128, action_size)
+        self.fc1 = nn.Linear(state_size, 128)  # Reduced for smaller state
+        self.fc2 = nn.Linear(128, 128)         # Reduced for smaller state
+        self.fc3 = nn.Linear(128, 64)          # Reduced for smaller state
+        self.fc4 = nn.Linear(64, action_size)
         
         # Batch normalization for faster training
-        self.bn1 = nn.BatchNorm1d(256)
-        self.bn2 = nn.BatchNorm1d(256)
-        self.bn3 = nn.BatchNorm1d(128)
+        self.bn1 = nn.BatchNorm1d(128)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.bn3 = nn.BatchNorm1d(64)
         
         self.dropout = nn.Dropout(0.1)  # Add dropout for regularization
         
@@ -436,7 +436,7 @@ def main():
     print("=" * 50)
     
     # Setup environment and agent
-    env = BalatroGymEnvSimple(blind_score=1500)  # Increased score requirement for 10 plays
+    env = BalatroGymEnvSimple()  # Increased score requirement for 10 plays
     state_size = env.observation_space.shape[0]
     action_size = env.action_space.n
     
@@ -511,7 +511,10 @@ def main():
         episode_hands = []  # Track hands played in this episode
         done = False
         
-        while not done:
+        step_count = 0
+        max_steps_per_episode = 50  # Prevent infinite loops
+        
+        while not done and step_count < max_steps_per_episode:
             action = agent.act(obs, training=True)
             next_obs, reward, done, truncated, info = env.step(action)
             
@@ -519,6 +522,12 @@ def main():
             obs = next_obs
             episode_reward += reward
             episode_length += 1
+            step_count += 1
+            
+            # Force episode end if too many steps
+            if step_count >= max_steps_per_episode:
+                done = True
+                reward -= 10.0  # Penalty for timeout
             
             # Train on batch
             if len(agent.memory) > BATCH_SIZE:
@@ -553,10 +562,11 @@ def main():
             # Use manual epsilon
             agent.epsilon = MANUAL_EPSILON
         
-
-        
         # Print progress
         if episode % 100 == 0:
+            # Add debugging info for stuck episodes
+            if step_count >= max_steps_per_episode:
+                print(f"⚠️ Episode {episode} hit step limit ({max_steps_per_episode}) - possible infinite loop")
             recent_rewards = episode_rewards[-100:]
             recent_wins = episode_wins[-100:]
             recent_scores = episode_scores[-100:]
@@ -593,19 +603,6 @@ def main():
                   f"Epsilon: {current_epsilon:.3f} | "
                   f"Speed: {episodes_per_sec:.1f} ep/s")
             print(f"  Recent Hands: {hand_summary}")
-        
-        # More frequent epsilon logging for debugging
-        # if episode % 100 == 0:
-        #     decay_info = agent.epsilon_decay.get_decay_info()
-        #     epsilon_status = "MIN" if agent.epsilon <= EPSILON_END else "DECAYING"
-        #     decay_progress = ((1.0 - agent.epsilon) / (1.0 - EPSILON_END)) * 100 if agent.epsilon > EPSILON_END else 100
-            
-        #     if decay_info["type"] == "adaptive":
-        #         print(f"  Epsilon: {agent.epsilon:.4f} ({epsilon_status}) - Type: {decay_info['type']} - Recent Performance: {decay_info['recent_performance']:.3f}")
-        #     elif decay_info["type"] == "curriculum":
-        #         print(f"  Epsilon: {agent.epsilon:.4f} ({epsilon_status}) - Type: {decay_info['type']} - Stage: {decay_info['current_stage']}")
-        #     else:
-        #         print(f"  Epsilon: {agent.epsilon:.4f} ({epsilon_status}) - Type: {decay_info['type']} - Steps: {decay_info['steps']} - Decay: {decay_progress:.1f}%")
         
         # Evaluation
         if episode % EVAL_INTERVAL == 0:
