@@ -405,12 +405,12 @@ def test_agent_behavior(agent, env, n_tests=3):
             action = agent.get_action(obs, eps=0.0)  # No exploration
             
             # Decode action
-            action_type, card_indices = env._decode_action(action)
-            selected_cards = [str(env.hand[i]) for i in card_indices if i < len(env.hand)]
+            # action_type, card_indices = env._decode_action(action)
+            # selected_cards = [str(env.hand[i]) for i in card_indices if i < len(env.hand)]
             
             print(f"🤖 Step {step + 1}:")
-            print(f"   Action: {action} -> {action_type}")
-            print(f"   Selected cards: {selected_cards}")
+            # print(f"   Action: {action} -> {action_type}")
+            # print(f"   Selected cards: {selected_cards}")
             
             # Take the action
             obs, reward, done, truncated, info = env.step(action)

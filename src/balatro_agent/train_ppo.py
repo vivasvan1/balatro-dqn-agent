@@ -12,6 +12,7 @@ import time
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from typing import Dict, List, Tuple, Any
+import os
 
 from ppo_agent import PPOAgent
 from balatro_gym_v2_simple import BalatroGymEnvSimple
@@ -22,19 +23,23 @@ class ComprehensivePPOTrainer:
     def __init__(
         self,
         blind_score: int = 300,
-        learning_rate: float = 3e-4,
+        learning_rate: float = 1e-4,
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
         clip_ratio: float = 0.2,
         value_loss_coef: float = 0.5,
-        entropy_coef: float = 0.01,
+        entropy_coef: float = 0.02,
         max_grad_norm: float = 0.5,
         target_kl: float = 0.01,
-        hidden_dim: int = 256,
-        device: str = "auto"
+        hidden_dim: int = 512,
+        device: str = "auto",
+        load_model_path: str = None,
+        curriculum_learning: bool = True
     ):
         self.blind_score = blind_score
         self.device = device if device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
+        self.load_model_path = load_model_path
+        self.curriculum_learning = curriculum_learning
         
         # Create environment and agent
         self.env = BalatroGymEnvSimple(blind_score=blind_score)
@@ -52,22 +57,36 @@ class ComprehensivePPOTrainer:
             device=self.device
         )
         
-        # Training stats
-        self.training_stats = {
-            'episode_rewards': [],
-            'episode_lengths': [],
-            'win_rates': [],
-            'policy_losses': [],
-            'value_losses': [],
-            'entropy_losses': [],
-            'kl_divergences': [],
-            'advantages': [],
-            'policy_ratios': [],
-            'entropies': [],
-            'action_distributions': [],
-            'avg_advantages': [],
-            'policy_confidence': []
-        }
+        # Load model if specified
+        if load_model_path and os.path.exists(load_model_path):
+            print(f"🔄 Loading model from {load_model_path}")
+            self.agent.load_model(load_model_path)
+            self.training_stats = self.agent.training_stats
+            print(f"✅ Model loaded successfully!")
+            print(f"   Previous training stats loaded:")
+            print(f"   - Policy losses: {len(self.training_stats.get('policy_losses', []))}")
+            print(f"   - Value losses: {len(self.training_stats.get('value_losses', []))}")
+            print(f"   - Episode rewards: {len(self.training_stats.get('episode_rewards', []))}")
+            print(f"   - Win rates: {len(self.training_stats.get('win_rates', []))}")
+        else:
+            # Initialize fresh training stats
+            self.training_stats = {
+                'episode_rewards': [],
+                'episode_lengths': [],
+                'win_rates': [],
+                'policy_losses': [],
+                'value_losses': [],
+                'entropy_losses': [],
+                'kl_divergences': [],
+                'advantages': [],
+                'policy_ratios': [],
+                'entropies': [],
+                'action_distributions': [],
+                'avg_advantages': [],
+                'policy_confidence': []
+            }
+            if load_model_path and not os.path.exists(load_model_path):
+                print(f"⚠️  Warning: Model file {load_model_path} not found. Starting fresh training.")
         
         print(f"🎰 Comprehensive PPO Trainer Initialized")
         print(f"  Target Score: {blind_score}")
@@ -75,6 +94,8 @@ class ComprehensivePPOTrainer:
         print(f"  State Dim: {self.env.observation_space.shape[0]}")
         print(f"  Action Dim: {self.env.action_space.n}")
         print(f"  Network Params: {sum(p.numel() for p in self.agent.actor_critic.parameters()):,}")
+        if load_model_path:
+            print(f"  Loaded Model: {load_model_path}")
         print("=" * 60)
     
     def train(
@@ -85,40 +106,92 @@ class ComprehensivePPOTrainer:
         eval_interval: int = 5000,
         num_eval_episodes: int = 10,
         save_interval: int = 25000,
+        backup_interval: int = 10000,
         demo_interval: int = 10000,
         debug_interval: int = 2000
     ):
         """Train with comprehensive monitoring and debugging"""
+        
+        # Create output directories
+        os.makedirs("checkpoints", exist_ok=True)
+        os.makedirs("plots", exist_ok=True)
+        os.makedirs("backups", exist_ok=True)
         
         print(f"🚀 Starting Comprehensive PPO Training")
         print(f"  Total Timesteps: {total_timesteps:,}")
         print(f"  Batch Size: {batch_size}")
         print(f"  Update Epochs: {update_epochs}")
         print(f"  Eval Interval: {eval_interval}")
+        print(f"  Save Interval: {save_interval}")
+        print(f"  Backup Interval: {backup_interval}")
         print(f"  Debug Interval: {debug_interval}")
+        print(f"  Curriculum Learning: {self.curriculum_learning}")
+        print(f"  Output folders: checkpoints/, plots/, backups/")
+        if self.load_model_path:
+            print(f"  Continuing from: {self.load_model_path}")
         print("=" * 60)
         
         timesteps_so_far = 0
         start_time = time.time()
         
-        # Initial evaluation
-        print("\n📊 Initial Evaluation:")
-        initial_eval_stats = self.evaluate(num_eval_episodes)
-        self.training_stats['episode_rewards'].append(initial_eval_stats['avg_reward'])
-        self.training_stats['episode_lengths'].append(initial_eval_stats['avg_length'])
-        self.training_stats['win_rates'].append(initial_eval_stats['win_rate'])
-        self.training_stats['action_distributions'].append(initial_eval_stats['action_distribution'])
-        print(f"  Average Reward: {initial_eval_stats['avg_reward']:.2f} \u00b1 {initial_eval_stats['std_reward']:.2f}")
-        print(f"  Win Rate: {initial_eval_stats['win_rate']:.2%}")
-        print(f"  Average Length: {initial_eval_stats['avg_length']:.1f}")
-        print(f"  Action Distribution: {initial_eval_stats['action_distribution']}")
-        print("-" * 40)
+        # Curriculum learning setup
+        if self.curriculum_learning:
+            curriculum_stages = [
+                {"blind_score": 100, "timesteps": total_timesteps // 4},  # Easy target
+                {"blind_score": 200, "timesteps": total_timesteps // 4},  # Medium target
+                {"blind_score": 250, "timesteps": total_timesteps // 4},  # Hard target
+                {"blind_score": self.blind_score, "timesteps": total_timesteps // 4}  # Final target
+            ]
+            current_stage = 0
+            stage_timesteps = 0
+            
+            # Start with easier target
+            self.env.blind_score = curriculum_stages[current_stage]["blind_score"]
+            print(f"📚 Curriculum Stage {current_stage + 1}: Target Score = {self.env.blind_score}")
+        
+        # Initial evaluation (skip if we have previous data)
+        if not self.training_stats['episode_rewards']:
+            print("\n📊 Initial Evaluation:")
+            initial_eval_stats = self.evaluate(num_eval_episodes)
+            self.training_stats['episode_rewards'].append(initial_eval_stats['avg_reward'])
+            self.training_stats['episode_lengths'].append(initial_eval_stats['avg_length'])
+            self.training_stats['win_rates'].append(initial_eval_stats['win_rate'])
+            self.training_stats['action_distributions'].append(initial_eval_stats['action_distribution'])
+            print(f"  Average Reward: {initial_eval_stats['avg_reward']:.2f} \u00b1 {initial_eval_stats['std_reward']:.2f}")
+            print(f"  Win Rate: {initial_eval_stats['win_rate']:.2%}")
+            print(f"  Average Length: {initial_eval_stats['avg_length']:.1f}")
+            print(f"  Action Distribution: {initial_eval_stats['action_distribution']}")
+            print("-" * 40)
+        else:
+            print(f"\n📊 Continuing from previous training with {len(self.training_stats['episode_rewards'])} evaluation points")
+            latest_reward = self.training_stats['episode_rewards'][-1]
+            latest_win_rate = self.training_stats['win_rates'][-1]
+            print(f"  Latest Average Reward: {latest_reward:.2f}")
+            print(f"  Latest Win Rate: {latest_win_rate:.2%}")
+            print("-" * 40)
         
         with tqdm(total=total_timesteps, desc="Training Progress") as pbar:
             while timesteps_so_far < total_timesteps:
+                # Curriculum learning: check if we should advance to next stage
+                if self.curriculum_learning and stage_timesteps >= curriculum_stages[current_stage]["timesteps"]:
+                    if current_stage < len(curriculum_stages) - 1:
+                        current_stage += 1
+                        stage_timesteps = 0
+                        self.env.blind_score = curriculum_stages[current_stage]["blind_score"]
+                        print(f"\n📚 Advancing to Curriculum Stage {current_stage + 1}: Target Score = {self.env.blind_score}")
+                        
+                        # Evaluate performance on new difficulty
+                        eval_stats = self.evaluate(num_eval_episodes)
+                        print(f"  Performance on new difficulty:")
+                        print(f"    Average Reward: {eval_stats['avg_reward']:.2f}")
+                        print(f"    Win Rate: {eval_stats['win_rate']:.2%}")
+                        print("-" * 40)
+                
                 # Collect batch
                 buffer = self.agent.collect_batch(batch_size)
                 timesteps_so_far += buffer.size
+                if self.curriculum_learning:
+                    stage_timesteps += buffer.size
                 
                 # Update policy
                 update_stats = self.agent.update(buffer, update_epochs)
@@ -147,6 +220,8 @@ class ComprehensivePPOTrainer:
                     self.training_stats['action_distributions'].append(eval_stats['action_distribution'])
                     
                     print(f"\n📊 Evaluation at {timesteps_so_far:,} timesteps:")
+                    if self.curriculum_learning:
+                        print(f"  Curriculum Stage: {current_stage + 1}/{len(curriculum_stages)}")
                     print(f"  Average Reward: {eval_stats['avg_reward']:.2f} ± {eval_stats['std_reward']:.2f}")
                     print(f"  Win Rate: {eval_stats['win_rate']:.2%}")
                     print(f"  Average Length: {eval_stats['avg_length']:.1f}")
@@ -160,16 +235,25 @@ class ComprehensivePPOTrainer:
                 # Demo episode
                 if timesteps_so_far % demo_interval == 0:
                     print(f"\n🎮 Demo Episode at {timesteps_so_far:,} timesteps:")
+                    if self.curriculum_learning:
+                        print(f"  Curriculum Stage: {current_stage + 1}/{len(curriculum_stages)}")
                     self._play_demo_episode()
                 
-                # Save model and plots
+                # Save backup model (more frequent)
+                if timesteps_so_far % backup_interval == 0:
+                    backup_path = f"backups/ppo_balatro_backup_{timesteps_so_far}.pth"
+                    self.agent.save_model(backup_path)
+                    print(f"\n💾 Backup model saved to {backup_path}")
+                
+                # Save model and plots (less frequent)
                 if timesteps_so_far % save_interval == 0:
-                    model_path = f"ppo_balatro_{timesteps_so_far}.pth"
+                    os.makedirs("checkpoints", exist_ok=True)
+                    model_path = f"checkpoints/ppo_balatro_{timesteps_so_far}.pth"
                     self.agent.save_model(model_path)
                     print(f"\n💾 Model saved to {model_path}")
                     
                     # Plot current training curves
-                    self.plot_training_curves(save_path=f"training_curves_{timesteps_so_far}.png")
+                    self.plot_training_curves(save_path=f"plots/training_curves_{timesteps_so_far}.png")
                 
                 pbar.update(buffer.size)
                 pbar.set_postfix({
@@ -195,12 +279,15 @@ class ComprehensivePPOTrainer:
         print("-" * 40)
         
         # Final save and evaluation
-        self.agent.save_model("ppo_balatro_final.pth")
-        self.plot_training_curves(save_path="final_training_curves.png")
+        self.agent.save_model("checkpoints/ppo_balatro_final.pth")
+        self.plot_training_curves(save_path="plots/final_training_curves.png")
         
         print(f"\n🎉 Training completed in {training_time:.1f} seconds!")
-        print(f"Final model saved to: ppo_balatro_final.pth")
-        print(f"Training curves saved to: final_training_curves.png")
+        print(f"Final model saved to: checkpoints/ppo_balatro_final.pth")
+        print(f"Training curves saved to: plots/final_training_curves.png")
+        
+
+
         
         return self.agent
     
@@ -302,9 +389,13 @@ class ComprehensivePPOTrainer:
         
         print(f"  Initial hand: {[str(card) for card in self.env.hand]}")
         print(f"  Target score: {self.env.blind_score}")
+        print()
         
         while step < max_steps:
             step += 1
+            
+            # Show current hand before action
+            print(f"  Step {step} - Hand: {[str(card) for card in self.env.hand]}")
             
             # Get action from policy
             with torch.no_grad():
@@ -316,15 +407,26 @@ class ComprehensivePPOTrainer:
             # Decode action
             action_type, card_indices = self.env._decode_action(action)
             
+            # Capture cards that will be played BEFORE taking the action
+            cards_to_play = [str(self.env.hand[i]) for i in card_indices if i < len(self.env.hand)]
+            
             # Take action
             obs, reward, done, truncated, info = self.env.step(action)
             obs = torch.FloatTensor(obs).to(self.device)
             total_reward += reward
             
             # Show action details
-            cards_str = [str(self.env.hand[i]) for i in card_indices if i < len(self.env.hand)]
-            print(f"  Step {step}: {action_type.upper()} {cards_str} (prob: {action_prob:.3f}, reward: {reward:.2f})")
+            print(f"    Action: {action_type.upper()} {cards_to_play} (prob: {action_prob:.3f}, reward: {reward:.2f})")
             print(f"    Score: {self.env.current_score}/{self.env.blind_score}, Plays: {self.env.plays_left}, Discards: {self.env.discards_left}")
+            
+            # Show hand type if it's a play action
+            if action_type == "play" and "hand_type" in info:
+                print(f"    Hand type: {info['hand_type']}")
+                print(f"    Score gained: {info.get('score_gained', 0)}")
+            
+            # Show new hand after the action
+            print(f"    New hand: {[str(card) for card in self.env.hand]}")
+            print()
             
             if done or truncated:
                 break
@@ -332,8 +434,11 @@ class ComprehensivePPOTrainer:
         print(f"  Final result: {'WIN' if self.env.won else 'LOSS'} (Total reward: {total_reward:.2f})")
         print()
     
-    def plot_training_curves(self, save_path: str = "training_curves.png"):
+    def plot_training_curves(self, save_path: str = "plots/training_curves.png"):
         """Plot comprehensive training curves with debugging info"""
+        # Ensure plots directory exists
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
         fig, axes = plt.subplots(4, 3, figsize=(20, 20))
         
         # Episode rewards
@@ -514,19 +619,23 @@ class ComprehensivePPOTrainer:
         print(f"   Episode lengths data points: {len(self.training_stats['episode_lengths'])}")
         print(f"   Policy losses data points: {len(self.training_stats['policy_losses'])}")
         plt.show()
-
+    
 def main():
     parser = argparse.ArgumentParser(description="Comprehensive PPO Training for Balatro")
     parser.add_argument("--blind-score", type=int, default=300, help="Target score to win")
     parser.add_argument("--timesteps", type=int, default=100000, help="Total timesteps for training")
     parser.add_argument("--batch-size", type=int, default=2048, help="Batch size for training")
-    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
-    parser.add_argument("--hidden-dim", type=int, default=256, help="Hidden dimension")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--hidden-dim", type=int, default=512, help="Hidden dimension")
     parser.add_argument("--clip-ratio", type=float, default=0.2, help="PPO clip ratio")
     parser.add_argument("--device", type=str, default="auto", help="Device to use")
     parser.add_argument("--eval-interval", type=int, default=5000, help="Evaluation interval")
+    parser.add_argument("--save-interval", type=int, default=25000, help="Save interval for main checkpoints")
+    parser.add_argument("--backup-interval", type=int, default=10000, help="Backup interval for intermediate saves")
     parser.add_argument("--demo-interval", type=int, default=10000, help="Demo interval")
     parser.add_argument("--debug-interval", type=int, default=2000, help="Debug interval")
+    parser.add_argument("--load-model", type=str, help="Path to model file to continue training from")
+    parser.add_argument("--no-curriculum", action="store_true", help="Disable curriculum learning")
     
     args = parser.parse_args()
     
@@ -536,7 +645,9 @@ def main():
         learning_rate=args.lr,
         clip_ratio=args.clip_ratio,
         hidden_dim=args.hidden_dim,
-        device=args.device
+        device=args.device,
+        load_model_path=args.load_model,
+        curriculum_learning=not args.no_curriculum
     )
     
     # Train
@@ -544,6 +655,8 @@ def main():
         total_timesteps=args.timesteps,
         batch_size=args.batch_size,
         eval_interval=args.eval_interval,
+        save_interval=args.save_interval,
+        backup_interval=args.backup_interval,
         demo_interval=args.demo_interval,
         debug_interval=args.debug_interval
     )

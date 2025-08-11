@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Simplified Balatro Gym Environment with reduced state space
-Focuses on essential information only to improve training stability
+Simplified Balatro Gym Environment with OpenAI Five-style multi-head actions
+Uses separate action heads for action type, card selection, etc.
 """
 
 import gymnasium as gym
@@ -13,15 +13,16 @@ import random
 # Import the card and hand classes from the original environment
 from balatro_gym_v2 import BalatroCard, BalatroHand
 
+
 class BalatroGymEnvSimple(gym.Env):
     """
-    Simplified Balatro Gym Environment with reduced state space
-    Focuses on essential game information only
+    Simplified Balatro Gym Environment with OpenAI Five-style multi-head actions
+    Uses separate action heads for better training stability
     """
-    
+
     def __init__(self, blind_score: int = 300):
         super().__init__()
-        
+
         # Game state
         self.blind_score = blind_score
         self.deck = self._create_deck()
@@ -32,67 +33,123 @@ class BalatroGymEnvSimple(gym.Env):
         self.current_score = 0
         self.game_over = False
         self.won = False
-        
-        # Action space: same as original
-        self.action_space = spaces.Discrete(self._calculate_valid_actions())
-        
-        # Simplified observation space:
+
+        # OpenAI Five-style multi-head action space (no 'pass' action):
+        # - action_type: 0=play, 1=discard (2 values)
+        # - card_count: 1-5 cards to select (5 values)
+        # - card_1: index of first card (8 values, 0-7)
+        # - card_2: index of second card (8 values, 0-7, or 0 if not used)
+        # - card_3: index of third card (8 values, 0-7, or 0 if not used)
+        # - card_4: index of fourth card (8 values, 0-7, or 0 if not used)
+        # - card_5: index of fifth card (8 values, 0-7, or 0 if not used)
+        # - priority: action priority/confidence (5 values, 0-4)
+        # Total: 7 action heads with varying dimensions
+        self.action_space = spaces.MultiDiscrete([2, 5, 8, 8, 8, 8, 8, 5])
+
+        # Enhanced observation space:
         # - 8 cards in hand (rank + suit) = 16 values
         # - plays_left = 1 value
-        # - discards_left = 1 value  
+        # - discards_left = 1 value
         # - current_score = 1 value
         # - blind_score = 1 value
         # - game_over = 1 value
-        # - progress_to_target = 1 value (new)
-        # - hand_quality_score = 1 value (new)
-        # Total: 23 values (much smaller than 229!)
+        # - progress_to_target = 1 value
+        # - hand_quality = 1 value
+        # - strategic_features = 8 values
+        # Total: 31 values
         self.observation_space = spaces.Box(
-            low=0, high=300, shape=(23,), dtype=np.float32
+            low=0, high=300, shape=(31,), dtype=np.float32
         )
-    
+
     def _create_deck(self) -> List[BalatroCard]:
         """Create a standard 52-card deck"""
-        ranks = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
-        suits = ['H', 'D', 'C', 'S']
+        ranks = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"]
+        suits = ["H", "D", "C", "S"]
         deck = [BalatroCard(rank, suit) for rank in ranks for suit in suits]
         random.shuffle(deck)
         return deck
-    
+
     def _deal_hand(self):
         """Deal 8 cards to hand"""
         if len(self.deck) < 8:
             self.deck = self._create_deck()
-        
+
         self.hand = self.deck[:8]
         self.deck = self.deck[8:]
-    
+
     def _encode_card(self, card: BalatroCard) -> Tuple[int, int]:
         """Encode card as (rank, suit) integers"""
         rank = card.get_rank_value()
-        suit_map = {'H': 0, 'D': 1, 'C': 2, 'S': 3}
+        suit_map = {"H": 0, "D": 1, "C": 2, "S": 3}
         suit = suit_map[card.suit]
         return rank, suit
-    
+
     def _calculate_hand_quality(self) -> float:
-        """Calculate a simple hand quality score"""
+        """Calculate a comprehensive hand quality score with strategic considerations"""
         if not self.hand:
             return 0.0
-        
+
         # Calculate potential scores for all possible hand combinations
         max_score = 0
         from itertools import combinations
-        
+
         for r in range(1, min(6, len(self.hand) + 1)):
             for combo in combinations(self.hand, r):
                 balatro_hand = BalatroHand(list(combo))
-                hand_type, base_chips, multiplier, card_chips = balatro_hand.evaluate_hand()
+                hand_type, base_chips, multiplier, card_chips = (
+                    balatro_hand.evaluate_hand()
+                )
                 total_score = (base_chips + card_chips) * multiplier
                 max_score = max(max_score, total_score)
-        
-        return max_score / 100.0  # Normalize
-    
+
+        # Add strategic bonuses for hand potential
+        strategic_bonus = self._calculate_hand_potential_bonus()
+
+        return (max_score + strategic_bonus) / 100.0  # Normalize
+
+    def _calculate_hand_potential_bonus(self) -> float:
+        """Calculate bonus for hand potential (flush, straight opportunities)"""
+        if not self.hand:
+            return 0.0
+
+        bonus = 0.0
+
+        # Count cards by suit
+        suit_counts = {"H": 0, "D": 0, "C": 0, "S": 0}
+        for card in self.hand:
+            suit_counts[card.suit] += 1
+
+        # Flush potential
+        max_suit_count = max(suit_counts.values())
+        if max_suit_count >= 4:
+            bonus += 50.0  # Very strong flush potential
+        elif max_suit_count == 3:
+            bonus += 25.0  # Good flush potential
+        elif max_suit_count == 2:
+            bonus += 10.0  # Some flush potential
+
+        # Count cards by rank
+        rank_counts = {}
+        for card in self.hand:
+            rank = card.get_rank_value()
+            rank_counts[rank] = rank_counts.get(rank, 0) + 1
+
+        # Pair/three-of-a-kind potential
+        for rank, count in rank_counts.items():
+            if count >= 3:
+                bonus += 30.0  # Three of a kind potential
+            elif count == 2:
+                bonus += 15.0  # Pair potential
+
+        # High card potential
+        high_cards = sum(1 for card in self.hand if card.get_rank_value() >= 10)
+        if high_cards >= 3:
+            bonus += 10.0  # Good high card potential
+
+        return bonus
+
     def _get_state(self) -> np.ndarray:
-        """Get simplified state as numpy array"""
+        """Get enhanced state as numpy array with strategic information"""
         # Encode hand (pad with zeros if less than 8 cards)
         hand_encoding = []
         for i in range(8):
@@ -101,187 +158,241 @@ class BalatroGymEnvSimple(gym.Env):
                 hand_encoding.extend([rank, suit])
             else:
                 hand_encoding.extend([0, 0])
-        
+
         # Calculate additional features
         progress_to_target = self.current_score / self.blind_score
+        print(f"Progress to target: {progress_to_target}")
+        
+        print(f"Calculating hand quality...")
         hand_quality = self._calculate_hand_quality()
-        
-        # Create simplified state vector
-        state = np.array([
-            *hand_encoding,      # 16 values (8 cards * 2 each)
-            self.plays_left,     # 1 value
-            self.discards_left,  # 1 value
-            self.current_score,  # 1 value
-            self.blind_score,    # 1 value
-            int(self.game_over), # 1 value
-            progress_to_target,  # 1 value (new)
-            hand_quality         # 1 value (new)
-        ], dtype=np.float32)
-        
+        print(f"Hand quality: {hand_quality}")
+
+        # Strategic features for better decision making
+        strategic_features = self._calculate_strategic_features()
+
+        # Create enhanced state vector
+        state = np.array(
+            [
+                *hand_encoding,  # 16 values (8 cards * 2 each)
+                self.plays_left,  # 1 value
+                self.discards_left,  # 1 value
+                self.current_score,  # 1 value
+                self.blind_score,  # 1 value
+                int(self.game_over),  # 1 value
+                progress_to_target,  # 1 value
+                hand_quality,  # 1 value
+                *strategic_features,  # strategic features
+            ],
+            dtype=np.float32,
+        )
+
         return state
-    
-    def _calculate_valid_actions(self) -> int:
-        """Calculate total number of valid actions"""
+
+    def _calculate_strategic_features(self) -> List[float]:
+        """Calculate strategic features to help the agent make better decisions"""
+        if not self.hand:
+            return [0.0] * 8  # Return zeros if no hand
+
+        features = []
+
+        # 1. Flush potential (0-1 scale)
+        suit_counts = {"H": 0, "D": 0, "C": 0, "S": 0}
+        for card in self.hand:
+            suit_counts[card.suit] += 1
+        max_suit_count = max(suit_counts.values())
+        flush_potential = min(max_suit_count / 5.0, 1.0)  # Normalize to 0-1
+        features.append(flush_potential)
+
+        # 2. Three-of-a-kind potential (0-1 scale)
+        rank_counts = {}
+        for card in self.hand:
+            rank = card.get_rank_value()
+            rank_counts[rank] = rank_counts.get(rank, 0) + 1
+        max_rank_count = max(rank_counts.values()) if rank_counts else 0
+        three_kind_potential = min(max_rank_count / 3.0, 1.0)
+        features.append(three_kind_potential)
+
+        # 3. High card ratio (0-1 scale)
+        high_cards = sum(1 for card in self.hand if card.get_rank_value() >= 10)
+        high_card_ratio = high_cards / len(self.hand)
+        features.append(high_card_ratio)
+
+        # 4. Current best hand score (normalized)
         from itertools import combinations
-        
-        valid_combinations = 0
-        for r in range(1, 6):
-            valid_combinations += len(list(combinations(range(8), r)))
-        
-        return valid_combinations * 2
-    
-    def _decode_action(self, action: int) -> Tuple[str, List[int]]:
-        """Decode action into action_type and card_indices"""
-        from itertools import combinations
-        
-        valid_combinations = 0
-        for r in range(1, 6):
-            valid_combinations += len(list(combinations(range(8), r)))
-        
-        if action < valid_combinations:
+
+        max_score = 0
+        for r in range(1, min(6, len(self.hand) + 1)):
+            for combo in combinations(self.hand, r):
+                balatro_hand = BalatroHand(list(combo))
+                hand_type, base_chips, multiplier, card_chips = (
+                    balatro_hand.evaluate_hand()
+                )
+                total_score = (base_chips + card_chips) * multiplier
+                max_score = max(max_score, total_score)
+        normalized_best_score = min(max_score / 100.0, 1.0)  # Normalize to 0-1
+        features.append(normalized_best_score)
+
+        # 5. Discard urgency (0-1 scale) - higher when we have bad hands and few discards left
+        if self.discards_left > 0:
+            if max_score < 30:  # Bad hand
+                discard_urgency = 1.0 - (
+                    self.discards_left / 3.0
+                )  # Higher urgency with fewer discards
+            else:
+                discard_urgency = 0.0
+        else:
+            discard_urgency = 0.0
+        features.append(discard_urgency)
+
+        # 6. Play urgency (0-1 scale) - higher when we have good hands and few plays left
+        if self.plays_left > 0:
+            if max_score > 50:  # Good hand
+                play_urgency = 1.0 - (
+                    self.plays_left / 3.0
+                )  # Higher urgency with fewer plays
+            else:
+                play_urgency = 0.0
+        else:
+            play_urgency = 0.0
+        features.append(play_urgency)
+
+        # 7. Hand diversity (0-1 scale) - measures how diverse the hand is
+        unique_ranks = len(set(card.get_rank_value() for card in self.hand))
+        unique_suits = len(set(card.suit for card in self.hand))
+        diversity = (unique_ranks + unique_suits) / 12.0  # Normalize to 0-1
+        features.append(diversity)
+
+        # 8. Strategic value (0-1 scale) - overall strategic value of the hand
+        strategic_value = (
+            flush_potential
+            + three_kind_potential
+            + high_card_ratio
+            + normalized_best_score
+        ) / 4.0
+        features.append(strategic_value)
+
+        return features
+
+    def _decode_multi_head_action(self, action: np.ndarray) -> Tuple[str, List[int]]:
+        """Decode multi-head action into action_type and card_indices (no pass)"""
+        # action is a numpy array with 8 values: [action_type, card_count, card_1, card_2, card_3, card_4, card_5, priority]
+        action_type_idx = action[0]
+        card_count = action[1]
+        card_indices = []
+        # Map action type
+        if action_type_idx == 0:
             action_type = "play"
-            action_index = action
         else:
             action_type = "discard"
-            action_index = action - valid_combinations
-        
-        card_indices = []
-        current_index = 0
-        
-        for r in range(1, 6):
-            combinations_r = list(combinations(range(8), r))
-            if current_index <= action_index < current_index + len(combinations_r):
-                combo_index = action_index - current_index
-                card_indices = list(combinations_r[combo_index])
-                break
-            current_index += len(combinations_r)
-        
+        # Extract card indices (only use the number specified by card_count)
+        for i in range(2, 2 + card_count):
+            card_idx = action[i]
+            if card_idx < len(self.hand) and card_idx not in card_indices:
+                card_indices.append(card_idx)
+        # Ensure we have valid cards
+        if not card_indices:
+            if len(self.hand) > 0:
+                card_indices = [random.randint(0, len(self.hand) - 1)]
         return action_type, card_indices
-    
+
     def _play_hand(self, card_indices: List[int]) -> Tuple[int, str]:
         """Play selected cards and return score and hand type"""
         if not card_indices:
             return 0, "Invalid"
-        
+
         if len(card_indices) > 5:
             card_indices = card_indices[:5]
-        
+
         selected_cards = [self.hand[i] for i in card_indices if i < len(self.hand)]
-        
+
         balatro_hand = BalatroHand(selected_cards)
         hand_type, base_chips, multiplier, card_chips = balatro_hand.evaluate_hand()
-        
+
         total_score = (base_chips + card_chips) * multiplier
-        
+
         cards_played = [self.hand[i] for i in card_indices if i < len(self.hand)]
         self.discarded_cards.extend(cards_played)
-        
+
         self.hand = [card for i, card in enumerate(self.hand) if i not in card_indices]
-        
+
         cards_to_draw = len(card_indices)
         if len(self.deck) < cards_to_draw:
             self.deck.extend(self._create_deck())
-        
+
         new_cards = self.deck[:cards_to_draw]
         self.deck = self.deck[cards_to_draw:]
         self.hand.extend(new_cards)
-        
+
         self.plays_left -= 1
         self.current_score += total_score
-        
+
         return total_score, hand_type
-    
+
     def _discard_cards(self, card_indices: List[int]) -> int:
         """Discard selected cards and return number discarded"""
         if not card_indices:
             return 0
-        
+
         if len(card_indices) > 5:
             card_indices = card_indices[:5]
-        
+
         cards_to_discard = [self.hand[i] for i in card_indices if i < len(self.hand)]
         self.discarded_cards.extend(cards_to_discard)
-        
+
         self.hand = [card for i, card in enumerate(self.hand) if i not in card_indices]
-        
+
         cards_to_draw = len(card_indices)
         if len(self.deck) < cards_to_draw:
             self.deck.extend(self._create_deck())
-        
+
         new_cards = self.deck[:cards_to_draw]
         self.deck = self.deck[cards_to_draw:]
         self.hand.extend(new_cards)
-        
+
         self.discards_left -= 1
-        
+
         return len(card_indices)
-    
+
     def _calculate_reward(self, action_type: str, result: Any) -> float:
-        """Calculate reward with strategic shaping for optimal play vs discard decisions"""
+        reward = 0.0
+
         if action_type == "play":
             score_gained, hand_type = result
-            
-            # Base reward from score gained
-            reward = score_gained / 25.0
-            
-            # Hand quality bonus
+            # Reward for score progress
+            reward += (score_gained / 25.0)
+            # Bonus for winning hand types
             hand_bonuses = {
-                "Royal Flush": 100, "Straight Flush": 60, "Four of a Kind": 40,
-                "Full House": 30, "Flush": 20, "Straight": 15,
-                "Three of a Kind": 10, "Two Pair": 6, "Pair": 2, "High Card": -5
+                "Royal Flush": 200, "Straight Flush": 150, "Four of a Kind": 100,
+                "Full House": 80, "Flush": 60, "Straight": 40,
+                "Three of a Kind": 30, "Two Pair": 15, "Pair": 5, "High Card": -10
             }
             reward += hand_bonuses.get(hand_type, 0)
-            
-            # Strategic penalty for playing weak hands when discards are available
-            if hand_type in ["High Card", "Pair"] and score_gained < 15 and self.discards_left > 0:
-                reward -= 15.0  # Strong penalty for playing weak hands when could discard
-            
-            # Bonus for good plays when close to target
-            if self.current_score / self.blind_score > 0.7 and score_gained > 20:
-                reward += 10.0  # Bonus for good plays when close to winning
-            
-            return reward
-        
+            # Penalty for playing weak hands if discards are available
+            if hand_type in ["High Card", "Pair"] and score_gained < 30 and self.discards_left > 0:
+                reward -= 50.0
+            # Small reward for getting closer to the blind score
+            reward += 2.0 * (self.current_score / self.blind_score)
         elif action_type == "discard":
-            # Base reward for discarding
-            reward = 8.0
-            
-            # Calculate best possible hand from current cards
-            if hasattr(self, 'hand') and self.hand:
-                from itertools import combinations
-                max_score = 0
-                best_hand_type = "High Card"
-                
-                for r in range(1, min(6, len(self.hand) + 1)):
-                    for combo in combinations(self.hand, r):
-                        from balatro_gym_v2 import BalatroHand
-                        balatro_hand = BalatroHand(list(combo))
-                        hand_type, base_chips, multiplier, card_chips = balatro_hand.evaluate_hand()
-                        total_score = (base_chips + card_chips) * multiplier
-                        if total_score > max_score:
-                            max_score = total_score
-                            best_hand_type = hand_type
-                
-                # Smart discard bonuses based on hand quality
-                if best_hand_type in ["High Card", "Pair"] and max_score < 25:
-                    reward += 20.0  # Strong bonus for discarding bad hands
-                elif best_hand_type in ["Two Pair", "Three of a Kind"] and max_score < 40:
-                    reward += 10.0  # Moderate bonus for discarding mediocre hands
-                else:
-                    reward -= 5.0  # Small penalty for discarding good hands
-            
-            # Bonus for strategic discarding (when plays are limited)
-            if self.plays_left <= 1 and self.discards_left > 1:
-                reward += 15.0  # Bonus for discarding when plays are scarce
-            
-            return reward
+            # Penalize discarding unless the hand is truly bad
+            if self._calculate_hand_quality() < 0.2:
+                reward -= 5.0  # Mild penalty for discarding bad hands
+            else:
+                reward -= 20.0  # Strong penalty for discarding decent hands
+            # Penalty for discarding too many times in a row
+            if hasattr(self, 'last_action') and self.last_action == "discard":
+                reward -= 10.0
+            # Small bonus for discarding when plays_left is low
+            if self.plays_left == 1:
+                reward += 5.0
         
-        return 0.0
-    
+        # Save last action for next step
+        self.last_action = action_type
+        return reward
+
     def reset(self, seed=None, options=None):
         """Reset the environment"""
         super().reset(seed=seed)
-        
+
         self.deck = self._create_deck()
         self._deal_hand()
         self.discarded_cards = []
@@ -290,26 +401,22 @@ class BalatroGymEnvSimple(gym.Env):
         self.current_score = 0
         self.game_over = False
         self.won = False
-        
+
         return self._get_state(), {}
-    
+
     def step(self, action):
-        """Take a step in the environment"""
+        """Take a step in the environment (no pass action)"""
         if self.game_over:
             return self._get_state(), 0.0, True, False, {}
-        
-        action_type, card_indices = self._decode_action(action)
-        
+        # Decode multi-head action
+        action_type, card_indices = self._decode_multi_head_action(action)
         # Validate action
         if action_type == "play" and self.plays_left <= 0:
             return self._get_state(), -50.0, True, False, {"error": "No plays left"}
-        
         if action_type == "discard" and self.discards_left <= 0:
             return self._get_state(), -50.0, True, False, {"error": "No discards left"}
-        
         if not card_indices:
             return self._get_state(), -10.0, False, False, {"error": "No cards selected"}
-        
         # Execute action
         if action_type == "play":
             cards_played = [str(self.hand[i]) for i in card_indices if i < len(self.hand)]
@@ -331,11 +438,8 @@ class BalatroGymEnvSimple(gym.Env):
                 "total_score": self.current_score,
                 "cards_selected": card_indices
             }
-        
         # Calculate reward
         reward = self._calculate_reward(action_type, result)
-        # print(f"Reward: {reward}, Action Type: {action_type}, Result: {result}")
-        
         # Check game end conditions
         if self.current_score >= self.blind_score:
             self.game_over = True
@@ -354,7 +458,6 @@ class BalatroGymEnvSimple(gym.Env):
                 max_score = 0
                 for r in range(1, min(6, len(self.hand) + 1)):
                     for combo in combinations(self.hand, r):
-                        from balatro_gym_v2 import BalatroHand
                         balatro_hand = BalatroHand(list(combo))
                         hand_type, base_chips, multiplier, card_chips = balatro_hand.evaluate_hand()
                         total_score = (base_chips + card_chips) * multiplier
@@ -369,9 +472,8 @@ class BalatroGymEnvSimple(gym.Env):
             "game_over": self.game_over,
             "won": self.won
         })
-        
         return self._get_state(), reward, self.game_over, False, info
-    
+
     def render(self):
         """Render the current state"""
         print(f"Hand: {[str(card) for card in self.hand]}")
@@ -381,15 +483,45 @@ class BalatroGymEnvSimple(gym.Env):
             print(f"Game Over! {'WON' if self.won else 'LOST'}")
         print("-" * 50)
 
+    def get_action_mask(self):
+        """
+        Returns a binary mask for each action head indicating valid actions.
+        Returns a list of masks, one for each action head.
+        """
+        masks = []
+        # Action type mask: [play, discard]
+        action_type_mask = [1, 1]
+        if self.plays_left <= 0:
+            action_type_mask[0] = 0  # Can't play
+        if self.discards_left <= 0:
+            action_type_mask[1] = 0  # Can't discard
+        masks.append(action_type_mask)
+        # Card count mask: [1, 2, 3, 4, 5]
+        card_count_mask = [1, 1, 1, 1, 1]
+        masks.append(card_count_mask)
+        # Card index masks: each card can be selected if it exists
+        for i in range(5):
+            card_mask = [1] * 8
+            for j in range(8):
+                if j >= len(self.hand):
+                    card_mask[j] = 0
+            masks.append(card_mask)
+        # Priority mask: [0, 1, 2, 3, 4]
+        priority_mask = [1, 1, 1, 1, 1]
+        masks.append(priority_mask)
+        return masks
+
+
 # Example usage
 if __name__ == "__main__":
     env = BalatroGymEnvSimple(blind_score=300)
     
-    print("🎰 Testing Simplified Balatro Gym Environment")
-    print("=" * 50)
+    print("🎰 Testing OpenAI Five-style Balatro Gym Environment")
+    print("=" * 60)
     
     obs, info = env.reset()
-    print(f"State size: {len(obs)} (vs 229 in original)")
+    print(f"State size: {len(obs)}")
+    print(f"Action space: {env.action_space}")
     print(f"Initial state: {obs}")
     
     total_reward = 0
@@ -397,8 +529,9 @@ if __name__ == "__main__":
     while not env.game_over:
         env.render()
         
+        # Sample a multi-head action
         action = env.action_space.sample()
-        action_type, card_indices = env._decode_action(action)
+        action_type, card_indices = env._decode_multi_head_action(action)
         
         print(f"Action: {action} -> {action_type} cards {card_indices}")
         
@@ -414,4 +547,4 @@ if __name__ == "__main__":
     
     env.render()
     print(f"Total reward: {total_reward:.2f}")
-    print("=" * 50) 
+    print("=" * 60)

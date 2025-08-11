@@ -2,7 +2,6 @@
 """
 PPO (Proximal Policy Optimization) Agent for Balatro Gym Environment
 Implements a complete PPO algorithm with actor-critic architecture
-Supports OpenAI Five-style multi-head actions
 """
 
 import torch
@@ -19,15 +18,15 @@ import matplotlib.pyplot as plt
 
 from balatro_gym_v2_simple import BalatroGymEnvSimple
 
-class MultiHeadActorCritic(nn.Module):
+class ActorCritic(nn.Module):
     """
-    Multi-head Actor-Critic neural network for PPO with OpenAI Five-style actions
-    Actor: outputs action probabilities for each action head
+    Actor-Critic neural network for PPO
+    Actor: outputs action probabilities
     Critic: outputs state value
     """
     
-    def __init__(self, state_dim: int, action_dims: List[int], hidden_dim: int = 256):
-        super(MultiHeadActorCritic, self).__init__()
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256):
+        super(ActorCritic, self).__init__()
         
         # Shared layers
         self.shared_layers = nn.Sequential(
@@ -37,15 +36,12 @@ class MultiHeadActorCritic(nn.Module):
             nn.ReLU(),
         )
         
-        # Multi-head actor (policy) heads
-        self.actor_heads = nn.ModuleList()
-        for action_dim in action_dims:
-            actor_head = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.ReLU(),
-                nn.Linear(hidden_dim // 2, action_dim),
-            )
-            self.actor_heads.append(actor_head)
+        # Actor (policy) head
+        self.actor = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, action_dim),
+        )
         
         # Critic (value) head
         self.critic = nn.Sequential(
@@ -61,19 +57,12 @@ class MultiHeadActorCritic(nn.Module):
         if isinstance(module, nn.Linear):
             torch.nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
             module.bias.data.zero_()
-        # Initialize value head with smaller weights for stability
-        if isinstance(module, nn.Linear) and module.out_features == 1:
-            torch.nn.init.orthogonal_(module.weight, gain=0.01)
-            module.bias.data.zero_()
     
     def forward(self, state):
         shared_features = self.shared_layers(state)
         
-        # Actor: logits for each action head
-        action_logits = []
-        for actor_head in self.actor_heads:
-            logits = actor_head(shared_features)
-            action_logits.append(logits)
+        # Actor: logits for action probabilities
+        action_logits = self.actor(shared_features)
         
         # Critic: state value
         value = self.critic(shared_features)
@@ -81,13 +70,9 @@ class MultiHeadActorCritic(nn.Module):
         return action_logits, value
     
     def get_action_probs(self, state):
-        """Get action probabilities from state for each head"""
+        """Get action probabilities from state"""
         action_logits, _ = self.forward(state)
-        action_probs = []
-        for logits in action_logits:
-            probs = F.softmax(logits, dim=-1)
-            action_probs.append(probs)
-        return action_probs
+        return F.softmax(action_logits, dim=-1)
     
     def get_value(self, state):
         """Get state value"""
@@ -96,34 +81,31 @@ class MultiHeadActorCritic(nn.Module):
 
 class PPOBuffer:
     """
-    Buffer for storing PPO training data with multi-head actions
+    Buffer for storing PPO training data
     """
     
-    def __init__(self, buffer_size: int, state_dim: int, action_dims: List[int], device: str = "cpu"):
+    def __init__(self, buffer_size: int, state_dim: int, device: str = "cpu"):
         self.buffer_size = buffer_size
         self.device = device
-        self.action_dims = action_dims
         
         # Storage
         self.states = torch.zeros((buffer_size, state_dim), dtype=torch.float32, device=device)
-        self.actions = [torch.zeros(buffer_size, dtype=torch.long, device=device) for _ in action_dims]
+        self.actions = torch.zeros(buffer_size, dtype=torch.long, device=device)
         self.rewards = torch.zeros(buffer_size, dtype=torch.float32, device=device)
         self.values = torch.zeros(buffer_size, dtype=torch.float32, device=device)
-        self.log_probs = [torch.zeros(buffer_size, dtype=torch.float32, device=device) for _ in action_dims]
+        self.log_probs = torch.zeros(buffer_size, dtype=torch.float32, device=device)
         self.dones = torch.zeros(buffer_size, dtype=torch.bool, device=device)
         
         self.ptr = 0
         self.size = 0
     
-    def add(self, state, actions, reward, value, log_probs, done):
+    def add(self, state, action, reward, value, log_prob, done):
         """Add a transition to the buffer"""
         self.states[self.ptr] = state
-        for i, action in enumerate(actions):
-            self.actions[i][self.ptr] = action
+        self.actions[self.ptr] = action
         self.rewards[self.ptr] = reward
         self.values[self.ptr] = value
-        for i, log_prob in enumerate(log_probs):
-            self.log_probs[i][self.ptr] = log_prob
+        self.log_probs[self.ptr] = log_prob
         self.dones[self.ptr] = done
         
         self.ptr = (self.ptr + 1) % self.buffer_size
@@ -133,10 +115,10 @@ class PPOBuffer:
         """Get all data from buffer"""
         return (
             self.states[:self.size],
-            [action[:self.size] for action in self.actions],
+            self.actions[:self.size],
             self.rewards[:self.size],
             self.values[:self.size],
-            [log_prob[:self.size] for log_prob in self.log_probs],
+            self.log_probs[:self.size],
             self.dones[:self.size]
         )
     
@@ -147,7 +129,7 @@ class PPOBuffer:
 
 class PPOAgent:
     """
-    PPO Agent for Balatro environment with multi-head actions
+    PPO Agent for Balatro environment
     """
     
     def __init__(
@@ -179,9 +161,9 @@ class PPOAgent:
         
         # Networks
         state_dim = env.observation_space.shape[0]
-        action_dims = env.action_space.nvec.tolist()  # Multi-head action dimensions
+        action_dim = env.action_space.n
         
-        self.actor_critic = MultiHeadActorCritic(state_dim, action_dims, hidden_dim).to(device)
+        self.actor_critic = ActorCritic(state_dim, action_dim, hidden_dim).to(device)
         self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=learning_rate)
         
         # Training stats
@@ -242,11 +224,12 @@ class PPOAgent:
             # Get action from policy
             with torch.no_grad():
                 action_logits, value = self.actor_critic(obs.unsqueeze(0))
-                action_probs = [torch.softmax(logits, dim=-1) for logits in action_logits]
-                action = [torch.argmax(probs).item() for probs in action_probs]
+                action_probs = torch.softmax(action_logits, dim=-1)
+                action = torch.argmax(action_probs).item()
+                action_prob = action_probs[0, action].item()
             
             # Decode action
-            action_type, card_indices = self.env._decode_multi_head_action(np.array(action))
+            action_type, card_indices = self.env._decode_action(action)
             
             # Capture cards that will be played BEFORE taking the action
             cards_to_play = [str(self.env.hand[i]) for i in card_indices if i < len(self.env.hand)]
@@ -257,7 +240,7 @@ class PPOAgent:
             total_reward += reward
             
             # Show action details
-            print(f"    Action: {action_type.upper()} {cards_to_play} (reward: {reward:.2f})")
+            print(f"    Action: {action_type.upper()} {cards_to_play} (prob: {action_prob:.3f}, reward: {reward:.2f})")
             print(f"    Score: {self.env.current_score}/{self.env.blind_score}, Plays: {self.env.plays_left}, Discards: {self.env.discards_left}")
             
             # Show new hand after the action
@@ -271,38 +254,24 @@ class PPOAgent:
         print()
     
     def compute_loss(self, states, actions, old_log_probs, advantages, returns):
-        """Compute PPO loss with multi-head actions"""
+        """Compute PPO loss"""
         action_logits, values = self.actor_critic(states)
         
-        # Policy loss for each action head
-        policy_loss = 0.0
-        entropy_loss = 0.0
-        kl_div = 0.0
+        # Policy loss
+        action_probs = F.softmax(action_logits, dim=-1)
+        dist = torch.distributions.Categorical(action_probs)
+        log_probs = dist.log_prob(actions)
         
-        for i, (logits, action, old_log_prob) in enumerate(zip(action_logits, actions, old_log_probs)):
-            action_probs = F.softmax(logits, dim=-1)
-            dist = torch.distributions.Categorical(action_probs)
-            log_probs = dist.log_prob(action)
-            
-            ratio = torch.exp(log_probs - old_log_prob)
-            surr1 = ratio * advantages
-            surr2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages
-            policy_loss += -torch.min(surr1, surr2).mean()
-            
-            # Entropy loss (for exploration)
-            entropy_loss += -dist.entropy().mean()
-            
-            # KL divergence for early stopping
-            kl_div += (old_log_prob - log_probs).mean()
-        
-        # Average over action heads
-        num_heads = len(action_logits)
-        policy_loss /= num_heads
-        entropy_loss /= num_heads
-        kl_div /= num_heads
+        ratio = torch.exp(log_probs - old_log_probs)
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages
+        policy_loss = -torch.min(surr1, surr2).mean()
         
         # Value loss
         value_loss = F.mse_loss(values.squeeze(), returns)
+        
+        # Entropy loss (for exploration)
+        entropy_loss = -dist.entropy().mean()
         
         # Total loss
         total_loss = (
@@ -311,70 +280,90 @@ class PPOAgent:
             self.entropy_coef * entropy_loss
         )
         
+        # KL divergence for early stopping
+        kl_div = (old_log_probs - log_probs).mean()
+        
         return total_loss, policy_loss, value_loss, entropy_loss, kl_div
     
-    def collect_batch(self, batch_size: int, max_steps_per_episode: int = 1000) -> PPOBuffer:
-        """Collect a batch of experiences with multi-head actions"""
-        action_dims = self.env.action_space.nvec.tolist()
-        buffer = PPOBuffer(batch_size, self.env.observation_space.shape[0], action_dims, self.device)
-        timesteps = 0
+    def collect_episode(self, max_steps: int = 1000) -> Tuple[List, List, List, List, List, List]:
+        """Collect a single episode"""
+        states, actions, rewards, values, log_probs, dones = [], [], [], [], [], []
         
-        while timesteps < batch_size:
-            obs, _ = self.env.reset()
-            obs = torch.FloatTensor(obs).to(self.device)
-            episode_reward = 0
-            episode_length = 0
+        obs, _ = self.env.reset()
+        obs = torch.FloatTensor(obs).to(self.device)
+        
+        for step in range(max_steps):
+            # Get action from policy
+            action_logits, value = self.actor_critic(obs.unsqueeze(0))
+            action_probs = F.softmax(action_logits, dim=-1)
+            dist = torch.distributions.Categorical(action_probs)
+            action = dist.sample()
+            log_prob = dist.log_prob(action)
             
-            while timesteps < batch_size:
+            # Take action
+            next_obs, reward, done, truncated, info = self.env.step(action.item())
+            next_obs = torch.FloatTensor(next_obs).to(self.device)
+            
+            # Store transition
+            states.append(obs)
+            actions.append(action)
+            rewards.append(reward)
+            values.append(value.squeeze())
+            log_probs.append(log_prob)
+            dones.append(done or truncated)
+            
+            obs = next_obs
+            
+            if done or truncated:
+                break
+        
+        return states, actions, rewards, values, log_probs, dones
+    
+    def collect_batch(self, batch_size: int, max_steps_per_episode: int = 1000) -> PPOBuffer:
+        """Collect a batch of episodes"""
+        buffer = PPOBuffer(batch_size, self.env.observation_space.shape[0], self.device)
+        
+        total_steps = 0
+        while total_steps < batch_size:
+            states, actions, rewards, values, log_probs, dones = self.collect_episode(max_steps_per_episode)
+            
+            # Convert to tensors
+            states = torch.stack(states)
+            actions = torch.stack(actions)
+            rewards = torch.FloatTensor(rewards).to(self.device)
+            values = torch.stack(values)
+            log_probs = torch.stack(log_probs)
+            dones = torch.BoolTensor(dones).to(self.device)
+            
+            # Compute GAE
+            if dones[-1].item():  # Convert boolean tensor to Python bool
+                next_value = 0.0
+            else:
                 with torch.no_grad():
-                    action_logits, value = self.actor_critic(obs.unsqueeze(0))
-                    
-                    # Sample actions for each head
-                    actions = []
-                    log_probs = []
-                    
-                    for i, logits in enumerate(action_logits):
-                        # Apply action masking if available
-                        if hasattr(self.env, 'get_action_mask'):
-                            masks = self.env.get_action_mask()
-                            if i < len(masks):
-                                mask = torch.tensor(masks[i], dtype=torch.bool, device=self.device)
-                                masked_logits = logits.clone()
-                                masked_logits[0][~mask] = -1e9
-                                action_probs = F.softmax(masked_logits, dim=-1)
-                            else:
-                                action_probs = F.softmax(logits, dim=-1)
-                        else:
-                            action_probs = F.softmax(logits, dim=-1)
-                        
-                        action = torch.multinomial(action_probs, 1).item()
-                        log_prob = F.log_softmax(logits, dim=-1)[0, action].item()
-                        
-                        actions.append(action)
-                        log_probs.append(log_prob)
-                    
-                    # Convert to numpy array for environment
-                    action_array = np.array(actions)
-                
-                next_obs, reward, done, truncated, _ = self.env.step(action_array)
-                next_obs = torch.FloatTensor(next_obs).to(self.device)
-                
-                buffer.add(obs, actions, reward, value.item(), log_probs, done or truncated)
-                obs = next_obs
-                episode_reward += reward
-                episode_length += 1
-                
-                if done or truncated:
-                    break
+                    next_obs = states[-1]
+                    _, next_value = self.actor_critic(next_obs.unsqueeze(0))
+                    next_value = next_value.squeeze()
+            
+            advantages, returns = self.compute_gae(rewards, values, dones, next_value)
+            
+            # Add to buffer
+            for i in range(len(states)):
+                if total_steps + i < batch_size:
+                    buffer.add(
+                        states[i].detach(), actions[i].detach(), rewards[i], 
+                        values[i].detach(), log_probs[i].detach(), dones[i]
+                    )
+            
+            total_steps += len(states)
         
         return buffer
     
     def update(self, buffer: PPOBuffer, epochs: int = 10) -> Dict[str, float]:
-        """Update policy using PPO with multi-head actions"""
+        """Update policy using PPO"""
         states, actions, rewards, values, log_probs, dones = buffer.get_all()
         
         # Compute GAE for the entire buffer
-        if dones[-1].item():
+        if dones[-1].item():  # Convert boolean tensor to Python bool
             next_value = 0.0
         else:
             with torch.no_grad():
@@ -384,14 +373,8 @@ class PPOAgent:
         
         advantages, returns = self.compute_gae(rewards, values, dones, next_value)
         
-        # Normalize advantages with better handling of small std
-        if len(advantages) > 0:
-            adv_std = advantages.std().item()
-            if adv_std > 1e-6:
-                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-            # If std is too small, don't normalize but scale up slightly to prevent zero gradients
-            else:
-                advantages = advantages * 10.0  # Scale up small advantages
+        # Normalize advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
         # PPO update
         update_stats = {
@@ -412,8 +395,8 @@ class PPOAgent:
                 batch_indices = indices[start_idx:end_idx]
                 
                 batch_states = states[batch_indices]
-                batch_actions = [action[batch_indices] for action in actions]
-                batch_old_log_probs = [log_prob[batch_indices] for log_prob in log_probs]
+                batch_actions = actions[batch_indices]
+                batch_old_log_probs = log_probs[batch_indices]
                 batch_advantages = advantages[batch_indices]
                 batch_returns = returns[batch_indices]
                 
@@ -452,7 +435,7 @@ class PPOAgent:
         self, 
         total_timesteps: int = 1000000,
         batch_size: int = 2048,
-        update_epochs: int = 8,
+        update_epochs: int = 10,
         eval_interval: int = 10000,
         num_eval_episodes: int = 10,
         save_interval: int = 50000,
@@ -464,7 +447,6 @@ class PPOAgent:
         
         print(f"Starting PPO training for {total_timesteps} timesteps")
         print(f"Batch size: {batch_size}, Update epochs: {update_epochs}")
-        print(f"Action space: {self.env.action_space}")
         print("=" * 60)
         
         with tqdm(total=total_timesteps, desc="Training Progress") as pbar:
@@ -525,8 +507,8 @@ class PPOAgent:
         self.save_model("ppo_balatro_final.pth")
         self.plot_training_curves(save_path="final_training_curves.png")
     
-    def evaluate(self, num_episodes: int = 10) -> Dict[str, Any]:
-        """Evaluate current policy with multi-head actions"""
+    def evaluate(self, num_episodes: int = 10) -> Dict[str, float]:
+        """Evaluate the current policy"""
         rewards = []
         lengths = []
         wins = 0
@@ -540,31 +522,12 @@ class PPOAgent:
             while True:
                 with torch.no_grad():
                     action_logits, _ = self.actor_critic(obs.unsqueeze(0))
-                    
-                    # Get best actions for each head
-                    actions = []
-                    for i, logits in enumerate(action_logits):
-                        # Apply action masking if available
-                        if hasattr(self.env, 'get_action_mask'):
-                            masks = self.env.get_action_mask()
-                            if i < len(masks):
-                                mask = torch.tensor(masks[i], dtype=torch.bool, device=self.device)
-                                masked_logits = logits.clone()
-                                masked_logits[0][~mask] = -1e9
-                                action_probs = F.softmax(masked_logits, dim=-1)
-                            else:
-                                action_probs = F.softmax(logits, dim=-1)
-                        else:
-                            action_probs = F.softmax(logits, dim=-1)
-                        
-                        action = torch.argmax(action_probs).item()
-                        actions.append(action)
-                    
-                    # Convert to numpy array for environment
-                    action_array = np.array(actions)
+                    action_probs = F.softmax(action_logits, dim=-1)
+                    action = torch.argmax(action_probs).item()
                 
-                obs, reward, done, truncated, info = self.env.step(action_array)
+                obs, reward, done, truncated, info = self.env.step(action)
                 obs = torch.FloatTensor(obs).to(self.device)
+                
                 episode_reward += reward
                 episode_length += 1
                 
@@ -579,6 +542,8 @@ class PPOAgent:
         return {
             'avg_reward': np.mean(rewards),
             'std_reward': np.std(rewards),
+            'min_reward': np.min(rewards),
+            'max_reward': np.max(rewards),
             'avg_length': np.mean(lengths),
             'win_rate': wins / num_episodes,
             'rewards': rewards,
@@ -740,7 +705,7 @@ def main():
     agent.train(
         total_timesteps=500000,  # Adjust based on your needs
         batch_size=2048,
-        update_epochs=8,
+        update_epochs=10,
         eval_interval=10000,
         num_eval_episodes=10,
         save_interval=50000
