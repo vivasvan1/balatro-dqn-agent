@@ -12,3 +12,15 @@ src/balatro_agent/mlruns
 src/balatro_agent/training_results_v2.png
 src/balatro_agent/training_plots_simple
 src/balatro_agent/diagnostics
+**/plots
+
+**/checkpoints/
+**/backups/
+**/mlruns/
+
+**/mlartifacts/
+**/logs/
+
+# Prevent accidental shadowing of the real MLflow package
+**/mlflow/
+**/mlflow_data/

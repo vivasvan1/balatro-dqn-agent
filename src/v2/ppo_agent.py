@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
 """
 PPO (Proximal Policy Optimization) Agent for Balatro Gym Environment
-Implements a complete PPO algorithm with actor-critic architecture
-Supports OpenAI Five-style multi-head actions
+
+This module contains a complete, self-contained PPO implementation tailored to
+the simplified Balatro environment that exposes an OpenAI Five-style
+multi-head action space. The code is organized into three primary parts:
+
+- MultiHeadActorCritic: a neural network with a shared torso and multiple
+  independent policy heads (one per action head), plus a value head.
+- PPOBuffer: a fixed-size, contiguous buffer used to store a single batch of
+  transitions for on-policy PPO updates.
+- PPOAgent: the orchestration layer that collects batches, computes advantages
+  and returns, performs PPO updates, evaluates, and plots training progress.
+
+Where helpful, comments explain the intent behind design decisions (the "why"),
+not just the mechanics (the "how").
 """
 
 import torch
@@ -17,7 +29,7 @@ import math
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-from balatro_gym_v2_simple import BalatroGymEnvSimple
+from balatro_gym_v2_simple import BalatroGymEnvSimple  # Environment interface
 
 
 class MultiHeadActorCritic(nn.Module):
@@ -30,7 +42,7 @@ class MultiHeadActorCritic(nn.Module):
     def __init__(self, state_dim: int, action_dims: List[int], hidden_dim: int = 256):
         super(MultiHeadActorCritic, self).__init__()
 
-        # Shared layers
+        # Shared layers: encode state into a compact latent representation
         self.shared_layers = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.ReLU(),
@@ -38,7 +50,7 @@ class MultiHeadActorCritic(nn.Module):
             nn.ReLU(),
         )
 
-        # Multi-head actor (policy) heads
+        # Multi-head actor (policy) heads: one categorical distribution per action head
         self.actor_heads = nn.ModuleList()
         for action_dim in action_dims:
             actor_head = nn.Sequential(
@@ -48,14 +60,14 @@ class MultiHeadActorCritic(nn.Module):
             )
             self.actor_heads.append(actor_head)
 
-        # Critic (value) head
+        # Critic (value) head: predicts V(s) to compute advantages
         self.critic = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
 
-        # Initialize weights
+        # Initialize weights for stability (orthogonal init)
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -112,17 +124,17 @@ class PPOBuffer:
         self.device = device
         self.action_dims = action_dims
 
-        # Storage
+        # Storage tensors (preallocated for performance)
         self.states = torch.zeros(
             (buffer_size, state_dim), dtype=torch.float32, device=device
         )
-        self.actions = [
+        self.actions = [  # list-of-tensors, aligned with multi-head discrete actions
             torch.zeros(buffer_size, dtype=torch.long, device=device)
             for _ in action_dims
         ]
         self.rewards = torch.zeros(buffer_size, dtype=torch.float32, device=device)
         self.values = torch.zeros(buffer_size, dtype=torch.float32, device=device)
-        self.log_probs = [
+        self.log_probs = [  # per-head log-probs of sampled actions
             torch.zeros(buffer_size, dtype=torch.float32, device=device)
             for _ in action_dims
         ]
@@ -184,7 +196,7 @@ class PPOAgent:
         self.env = env
         self.device = device
 
-        # PPO hyperparameters
+        # PPO hyperparameters (exposed for clarity/tuning)
         self.learning_rate = learning_rate
         self.gamma = gamma
         self.gae_lambda = gae_lambda
@@ -194,7 +206,7 @@ class PPOAgent:
         self.max_grad_norm = max_grad_norm
         self.target_kl = target_kl
 
-        # Networks
+        # Networks: infer dimensions from env spaces
         state_dim = env.observation_space.shape[0]
         action_dims = env.action_space.nvec.tolist()  # Multi-head action dimensions
 
@@ -222,12 +234,14 @@ class PPOAgent:
 
     def compute_gae(self, rewards, values, dones, next_value):
         """Compute Generalized Advantage Estimation"""
+        # Advantages buffer (same shape as rewards)
         advantages = torch.zeros_like(rewards)
         last_advantage = 0
 
         # Convert dones to float for arithmetic operations
         dones_float = dones.float()
 
+        # Walk backward through the rollout computing temporal-difference residuals (delta)
         for t in reversed(range(len(rewards))):
             if t == len(rewards) - 1:
                 next_value_t = next_value
@@ -239,6 +253,7 @@ class PPOAgent:
                 + self.gamma * next_value_t * (1 - dones_float[t])
                 - values[t]
             )
+            # Standard GAE recurrence
             advantages[t] = (
                 delta
                 + self.gamma * self.gae_lambda * (1 - dones_float[t]) * last_advantage
@@ -374,7 +389,8 @@ class PPOAgent:
                     log_probs = []
 
                     for i, logits in enumerate(action_logits):
-                        # Apply action masking if available
+                        # Apply action masking if available; use same dist for sampling and log_prob
+                        use_logits = logits
                         if hasattr(self.env, "get_action_mask"):
                             masks = self.env.get_action_mask()
                             if i < len(masks):
@@ -383,14 +399,11 @@ class PPOAgent:
                                 )
                                 masked_logits = logits.clone()
                                 masked_logits[0][~mask] = -1e9
-                                action_probs = F.softmax(masked_logits, dim=-1)
-                            else:
-                                action_probs = F.softmax(logits, dim=-1)
-                        else:
-                            action_probs = F.softmax(logits, dim=-1)
+                                use_logits = masked_logits
+                        action_probs = F.softmax(use_logits, dim=-1)
 
                         action = torch.multinomial(action_probs, 1).item()
-                        log_prob = F.log_softmax(logits, dim=-1)[0, action].item()
+                        log_prob = F.log_softmax(use_logits, dim=-1)[0, action].item()
 
                         actions.append(action)
                         log_probs.append(log_prob)
@@ -404,11 +417,15 @@ class PPOAgent:
                 buffer.add(
                     obs, actions, reward, value.item(), log_probs, done or truncated
                 )
+                timesteps += 1
                 obs = next_obs
                 episode_reward += reward
                 episode_length += 1
 
                 if done or truncated:
+                    break
+
+                if timesteps >= batch_size:
                     break
 
         return buffer
@@ -428,16 +445,21 @@ class PPOAgent:
 
         advantages, returns = self.compute_gae(rewards, values, dones, next_value)
 
-        # Normalize advantages with better handling of small std
+        # Normalize advantages; add robust fallback if advantages collapse to ~0
         if len(advantages) > 0:
             adv_std = advantages.std().item()
+            adv_max_abs = advantages.abs().max().item()
             if adv_std > 1e-6:
-                advantages = (advantages - advantages.mean()) / (
-                    advantages.std() + 1e-8
-                )
-            # If std is too small, don't normalize but scale up slightly to prevent zero gradients
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
             else:
-                advantages = advantages * 10.0  # Scale up small advantages
+                # If advantages are numerically near-constant or zero, try a simple reward baseline
+                approx_adv = rewards - rewards.mean()
+                approx_std = approx_adv.std().item()
+                if approx_std > 1e-6:
+                    advantages = (approx_adv - approx_adv.mean()) / (approx_adv.std() + 1e-8)
+                elif adv_max_abs <= 1e-8:
+                    # As a last resort, set a small non-zero advantage to encourage learning
+                    advantages = torch.full_like(advantages, 0.1)
 
         # PPO update
         update_stats = {

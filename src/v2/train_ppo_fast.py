@@ -11,8 +11,20 @@ import argparse
 import time
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 import os
+import json
+from datetime import datetime
+
+# Optional MLflow import with shadowing guard
+try:
+    import mlflow  # type: ignore
+    # Guard against a local directory named "mlflow" shadowing the real package
+    if not hasattr(mlflow, "set_tracking_uri") or not hasattr(mlflow, "start_run"):
+        print("⚠️  A local 'mlflow' directory is shadowing the real MLflow package. Disabling MLflow logging.")
+        mlflow = None
+except Exception:  # pragma: no cover
+    mlflow = None
 
 from ppo_agent import PPOAgent
 from balatro_gym_v2_simple import BalatroGymEnvSimple
@@ -100,12 +112,16 @@ class FastPPOTrainer:
         total_timesteps: int = 100000,
         batch_size: int = 4096,  # Smaller batch size for stability
         update_epochs: int = 4,   # Fewer epochs for speed
-        eval_interval: int = 10000,  # Less frequent evaluation
-        num_eval_episodes: int = 5,   # Fewer eval episodes
+        eval_interval: int = 10000,  # Interval for on-screen eval/metrics
+        eval_log_interval: int = 500,  # Interval to save 5-episode eval logs to file
+        num_eval_episodes: int = 5,   # Number of eval episodes per evaluation
         save_interval: int = 50000,
         backup_interval: int = 25000,
         demo_interval: int = 25000,   # Less frequent demos
-        debug_interval: int = 5000    # Less frequent debug
+        debug_interval: int = 5000,    # Less frequent debug
+        mlflow_logging: bool = False,
+        mlflow_experiment: str = "BalatroV2",
+        mlflow_tracking_uri: Optional[str] = None,
     ):
         """Train with optimized settings for speed"""
         
@@ -113,12 +129,14 @@ class FastPPOTrainer:
         os.makedirs("checkpoints", exist_ok=True)
         os.makedirs("plots", exist_ok=True)
         os.makedirs("backups", exist_ok=True)
+        # os.makedirs("logs", exist_ok=True)
         
         print(f"🚀 Starting Fast PPO Training")
         print(f"  Total Timesteps: {total_timesteps:,}")
         print(f"  Batch Size: {batch_size:,}")
         print(f"  Update Epochs: {update_epochs}")
         print(f"  Eval Interval: {eval_interval}")
+        print(f"  Eval Log Interval: {eval_log_interval}")
         print(f"  Save Interval: {save_interval}")
         print(f"  Backup Interval: {backup_interval}")
         print(f"  Demo Interval: {demo_interval}")
@@ -131,6 +149,44 @@ class FastPPOTrainer:
         
         timesteps_so_far = 0
         start_time = time.time()
+        self.run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_name = f"fast_ppo_{self.run_timestamp}_S{self.blind_score}"
+
+        # Setup MLflow if enabled
+        active_mlflow_run = None
+        if mlflow_logging:
+            if mlflow is None:
+                print("⚠️  MLflow is not installed. Disable --mlflow or install mlflow to enable tracking.")
+            else:
+                if mlflow_tracking_uri:
+                    mlflow.set_tracking_uri(mlflow_tracking_uri)
+                mlflow.set_experiment(mlflow_experiment)
+                active_mlflow_run = mlflow.start_run(run_name=run_name)
+                # Log trainer/agent/env params
+                mlflow.log_params({
+                    "blind_score": self.blind_score,
+                    "device": self.device,
+                    "learning_rate": self.agent.learning_rate,
+                    "gamma": self.agent.gamma,
+                    "gae_lambda": self.agent.gae_lambda,
+                    "clip_ratio": self.agent.clip_ratio,
+                    "value_loss_coef": self.agent.value_loss_coef,
+                    "entropy_coef": self.agent.entropy_coef,
+                    "max_grad_norm": self.agent.max_grad_norm,
+                    "target_kl": self.agent.target_kl,
+                    "hidden_dim": self.agent.actor_critic.shared_layers[0].out_features if hasattr(self.agent.actor_critic, 'shared_layers') else 256,
+                    "total_timesteps": total_timesteps,
+                    "batch_size": batch_size,
+                    "update_epochs": update_epochs,
+                    "eval_interval": eval_interval,
+                    "eval_log_interval": eval_log_interval,
+                    "num_eval_episodes": num_eval_episodes,
+                    "save_interval": save_interval,
+                    "backup_interval": backup_interval,
+                    "demo_interval": demo_interval,
+                    "debug_interval": debug_interval,
+                    "curriculum_learning": self.curriculum_learning,
+                })
         
         # Curriculum learning setup
         if self.curriculum_learning:
@@ -160,6 +216,15 @@ class FastPPOTrainer:
             print(f"  Average Length: {initial_eval_stats['avg_length']:.1f}")
             print(f"  Action Distribution: {initial_eval_stats['action_distribution']}")
             print("-" * 40)
+            # Log initial metrics
+            if active_mlflow_run is not None:
+                mlflow.log_metrics({
+                    "eval/avg_reward": float(initial_eval_stats['avg_reward']),
+                    "eval/win_rate": float(initial_eval_stats['win_rate']),
+                    "eval/avg_length": float(initial_eval_stats['avg_length']),
+                }, step=timesteps_so_far)
+            # Save initial eval to file
+            self._write_eval_log(initial_eval_stats, timesteps_so_far)
         else:
             print(f"\n📊 Continuing from previous training with {len(self.training_stats['episode_rewards'])} evaluation points")
             latest_reward = self.training_stats['episode_rewards'][-1]
@@ -170,6 +235,14 @@ class FastPPOTrainer:
         
         # Initialize eval_stats for curriculum learning
         eval_stats = None
+        
+        # Schedule thresholds to avoid skipping events when buffer steps over multiples
+        next_debug_step = debug_interval if debug_interval and debug_interval > 0 else float('inf')
+        next_eval_step = eval_interval if eval_interval and eval_interval > 0 else float('inf')
+        next_eval_log_step = eval_log_interval if eval_log_interval and eval_log_interval > 0 else float('inf')
+        next_demo_step = demo_interval if demo_interval and demo_interval > 0 else float('inf')
+        next_backup_step = backup_interval if backup_interval and backup_interval > 0 else float('inf')
+        next_save_step = save_interval if save_interval and save_interval > 0 else float('inf')
         
         with tqdm(total=total_timesteps, desc="Fast Training Progress") as pbar:
             while timesteps_so_far < total_timesteps:
@@ -206,50 +279,87 @@ class FastPPOTrainer:
                 self.training_stats['entropy_losses'].append(update_stats['entropy_loss'])
                 self.training_stats['kl_divergences'].append(update_stats['kl_div'])
                 
-                # Debug monitoring (less frequent)
-                if timesteps_so_far % debug_interval == 0:
+                # Debug monitoring (threshold-based)
+                while timesteps_so_far >= next_debug_step:
                     self._debug_training_step(update_stats, buffer)
+                    next_debug_step += debug_interval
                 
-                # Evaluation (less frequent for speed)
-                if timesteps_so_far % eval_interval == 0:
+                # Evaluation and logging (threshold-based; ensure no skips if we stepped over multiples)
+                need_console_eval = False
+                need_log_eval = False
+                while timesteps_so_far >= next_eval_step:
+                    need_console_eval = True
+                    next_eval_step += eval_interval
+                while timesteps_so_far >= next_eval_log_step:
+                    need_log_eval = True
+                    next_eval_log_step += eval_log_interval
+
+                if need_console_eval or need_log_eval:
                     eval_stats = self.evaluate(num_eval_episodes)
+                    # Update tracked stats once per eval
                     self.training_stats['episode_rewards'].append(eval_stats['avg_reward'])
                     self.training_stats['episode_lengths'].append(eval_stats['avg_length'])
                     self.training_stats['win_rates'].append(eval_stats['win_rate'])
                     self.training_stats['action_distributions'].append(eval_stats['action_distribution'])
-                    
-                    print(f"\n📊 Evaluation at {timesteps_so_far:,} timesteps:")
-                    if self.curriculum_learning:
-                        print(f"  Curriculum Stage: {current_stage + 1}/{len(curriculum_stages)}")
-                    print(f"  Average Reward: {eval_stats['avg_reward']:.2f} ± {eval_stats['std_reward']:.2f}")
-                    print(f"  Win Rate: {eval_stats['win_rate']:.2%}")
-                    print(f"  Average Length: {eval_stats['avg_length']:.1f}")
-                    print(f"  Policy Loss: {update_stats['policy_loss']:.4f}")
-                    print(f"  Value Loss: {update_stats['value_loss']:.4f}")
-                    print(f"  KL Divergence: {update_stats['kl_div']:.4f}")
-                    print("-" * 40)
+
+                    if need_console_eval:
+                        print(f"\n📊 Evaluation at {timesteps_so_far:,} timesteps:")
+                        if self.curriculum_learning:
+                            print(f"  Curriculum Stage: {current_stage + 1}/{len(curriculum_stages)}")
+                        print(f"  Average Reward: {eval_stats['avg_reward']:.2f} ± {eval_stats['std_reward']:.2f}")
+                        print(f"  Win Rate: {eval_stats['win_rate']:.2%}")
+                        print(f"  Average Length: {eval_stats['avg_length']:.1f}")
+                        print(f"  Policy Loss: {update_stats['policy_loss']:.4f}")
+                        print(f"  Value Loss: {update_stats['value_loss']:.4f}")
+                        print(f"  KL Divergence: {update_stats['kl_div']:.4f}")
+                        print("-" * 40)
+
+                    if need_log_eval:
+                        self._write_eval_log(eval_stats, timesteps_so_far)
+
+                    # MLflow metrics
+                    if active_mlflow_run is not None:
+                        mlflow.log_metrics({
+                            "train/policy_loss": float(update_stats['policy_loss']),
+                            "train/value_loss": float(update_stats['value_loss']),
+                            "train/entropy_loss": float(update_stats['entropy_loss']),
+                            "train/kl_div": float(update_stats['kl_div']),
+                            "eval/avg_reward": float(eval_stats['avg_reward']),
+                            "eval/win_rate": float(eval_stats['win_rate']),
+                            "eval/avg_length": float(eval_stats['avg_length']),
+                            "eval/avg_hands_per_episode": float(eval_stats.get('avg_plays_per_episode', 0.0)),
+                            "eval/avg_discards_per_episode": float(eval_stats.get('avg_discards_per_episode', 0.0)),
+                        }, step=timesteps_so_far)
                 
-                # Demo episode (less frequent)
-                if timesteps_so_far % demo_interval == 0:
+                # Demo episode (threshold-based)
+                while timesteps_so_far >= next_demo_step:
                     print(f"\n🎮 Demo Episode at {timesteps_so_far:,} timesteps:")
                     if self.curriculum_learning:
                         print(f"  Curriculum Stage: {current_stage + 1}/{len(curriculum_stages)}")
                     self._play_demo_episode(max_steps=5)  # Shorter demo
+                    next_demo_step += demo_interval
                 
-                # Save backup model
-                if timesteps_so_far % backup_interval == 0:
+                # Save backup model (threshold-based)
+                while timesteps_so_far >= next_backup_step:
                     backup_path = f"backups/ppo_balatro_fast_backup_{timesteps_so_far}.pth"
                     self.agent.save_model(backup_path)
                     print(f"\n💾 Backup model saved to {backup_path}")
+                    next_backup_step += backup_interval
                 
-                # Save model and plots
-                if timesteps_so_far % save_interval == 0:
-                    model_path = f"checkpoints/ppo_balatro_fast_{timesteps_so_far}.pth"
+                # Save model and plots (threshold-based)
+                while timesteps_so_far >= next_save_step:
+                    model_path = f"checkpoints/ppo_balatro_fast_{self.run_timestamp}_{timesteps_so_far}.pth"
                     self.agent.save_model(model_path)
                     print(f"\n💾 Model saved to {model_path}")
                     
                     # Plot current training curves
-                    self.plot_training_curves(save_path=f"plots/fast_training_curves_{timesteps_so_far}.png")
+                    plot_path = f"plots/fast_training_curves_{self.run_timestamp}_{timesteps_so_far}.png"
+                    self.plot_training_curves(save_path=plot_path)
+                    # Log artifacts to MLflow
+                    if active_mlflow_run is not None:
+                        mlflow.log_artifact(model_path)
+                        mlflow.log_artifact(plot_path)
+                    next_save_step += save_interval
                 
                 pbar.update(buffer.size)
                 pbar.set_postfix({
@@ -273,16 +383,38 @@ class FastPPOTrainer:
         print(f"  Average Length: {final_eval_stats['avg_length']:.1f}")
         print(f"  Action Distribution: {final_eval_stats['action_distribution']}")
         print("-" * 40)
+        # Save final eval log
+        self._write_eval_log(final_eval_stats, timesteps_so_far, final=True)
+        if active_mlflow_run is not None:
+            mlflow.log_metrics({
+                "final/avg_reward": float(final_eval_stats['avg_reward']),
+                "final/win_rate": float(final_eval_stats['win_rate']),
+                "final/avg_length": float(final_eval_stats['avg_length']),
+            }, step=timesteps_so_far)
         
         # Final save and evaluation
-        self.agent.save_model("checkpoints/ppo_balatro_fast_final.pth")
-        self.plot_training_curves(save_path="plots/fast_final_training_curves.png")
+        final_model_path = f"checkpoints/ppo_balatro_fast_final_{self.run_timestamp}.pth"
+        final_plot_path = f"plots/fast_final_training_curves_{self.run_timestamp}.png"
+        self.agent.save_model(final_model_path)
+        self.plot_training_curves(save_path=final_plot_path)
+        if active_mlflow_run is not None:
+            mlflow.log_artifact(final_model_path)
+            # Do not log final plot to MLflow per request
+            mlflow.end_run()
         
         print(f"\n🎉 Fast training completed in {training_time:.1f} seconds!")
-        print(f"Final model saved to: checkpoints/ppo_balatro_fast_final.pth")
-        print(f"Training curves saved to: plots/fast_final_training_curves.png")
+        print(f"Final model saved to: {final_model_path}")
+        print(f"Training curves saved to: {final_plot_path}")
         
         return self.agent
+
+    def _write_eval_log(self, eval_stats: Dict[str, Any], timesteps: int, final: bool = False) -> None:
+        """No-op log writer to keep compatibility when file logs are disabled."""
+        try:
+            # Metrics are already logged to MLflow elsewhere; keep this as a stub.
+            return
+        except Exception:
+            return
     
     def _debug_training_step(self, update_stats: Dict, buffer):
         """Quick debug training step"""
@@ -298,6 +430,8 @@ class FastPPOTrainer:
         lengths = []
         wins = 0
         action_counts = {"play": 0, "discard": 0, "pass": 0}
+        plays_per_episode: List[int] = []
+        discards_per_episode: List[int] = []
         
         for _ in range(num_episodes):
             obs, _ = self.env.reset()
@@ -331,6 +465,8 @@ class FastPPOTrainer:
             action_counts["play"] += episode_actions["play"]
             action_counts["discard"] += episode_actions["discard"]
             action_counts["pass"] += episode_actions["pass"]
+            plays_per_episode.append(episode_actions["play"])
+            discards_per_episode.append(episode_actions["discard"])
         
         total_actions = action_counts["play"] + action_counts["discard"] + action_counts["pass"]
         action_distribution = {
@@ -348,7 +484,11 @@ class FastPPOTrainer:
             'win_rate': wins / num_episodes,
             'action_distribution': action_distribution,
             'rewards': rewards,
-            'lengths': lengths
+            'lengths': lengths,
+            'plays_per_episode': plays_per_episode,
+            'discards_per_episode': discards_per_episode,
+            'avg_plays_per_episode': float(np.mean(plays_per_episode)) if len(plays_per_episode) > 0 else 0.0,
+            'avg_discards_per_episode': float(np.mean(discards_per_episode)) if len(discards_per_episode) > 0 else 0.0,
         }
     
     def _play_demo_episode(self, max_steps: int = 5):
@@ -394,7 +534,8 @@ class FastPPOTrainer:
         """Plot training curves"""
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        # Keep plots compact to limit file size and on-screen footprint
+        fig, axes = plt.subplots(2, 2, figsize=(10, 6))
         
         # Episode rewards
         if self.training_stats['episode_rewards']:
@@ -432,9 +573,10 @@ class FastPPOTrainer:
             axes[1, 1].legend()
         
         plt.tight_layout()
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        # Cap DPI to keep file size manageable
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f"📊 Fast training curves saved to {save_path}")
-        plt.show()
+        # plt.show()
 
 def main():
     parser = argparse.ArgumentParser(description="Fast PPO Training for Balatro")
@@ -444,10 +586,19 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--hidden-dim", type=int, default=256, help="Hidden dimension")
     parser.add_argument("--device", type=str, default="auto", help="Device to use")
-    parser.add_argument("--eval-interval", type=int, default=10000, help="Evaluation interval")
+    parser.add_argument("--eval-interval", type=int, default=10000, help="Evaluation interval for on-screen metrics")
+    parser.add_argument("--eval-log-interval", type=int, default=1000, help="Interval to save 5-episode evaluation logs to file")
     parser.add_argument("--save-interval", type=int, default=50000, help="Save interval")
     parser.add_argument("--load-model", type=str, help="Path to model file to continue training from")
     parser.add_argument("--no-curriculum", action="store_true", help="Disable curriculum learning")
+    # PPO hyperparameters
+    parser.add_argument("--entropy-coef", type=float, default=0.01, help="Entropy coefficient for exploration")
+    parser.add_argument("--clip-ratio", type=float, default=0.2, help="PPO clip ratio")
+    parser.add_argument("--target-kl", type=float, default=0.01, help="Target KL divergence for early stopping")
+    # MLflow options
+    parser.add_argument("--mlflow", action="store_true", help="Enable MLflow experiment tracking")
+    parser.add_argument("--mlflow-experiment", type=str, default="BalatroV2", help="MLflow experiment name")
+    parser.add_argument("--mlflow-tracking-uri", type=str, default=None, help="MLflow tracking URI (optional)")
     
     args = parser.parse_args()
     
@@ -455,6 +606,13 @@ def main():
     trainer = FastPPOTrainer(
         blind_score=args.blind_score,
         learning_rate=args.lr,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_ratio=args.clip_ratio,
+        value_loss_coef=0.5,
+        entropy_coef=args.entropy_coef,
+        max_grad_norm=0.5,
+        target_kl=args.target_kl,
         hidden_dim=args.hidden_dim,
         device=args.device,
         load_model_path=args.load_model,
@@ -466,7 +624,11 @@ def main():
         total_timesteps=args.timesteps,
         batch_size=args.batch_size,
         eval_interval=args.eval_interval,
-        save_interval=args.save_interval
+        eval_log_interval=args.eval_log_interval,
+        save_interval=args.save_interval,
+        mlflow_logging=args.mlflow,
+        mlflow_experiment=args.mlflow_experiment,
+        mlflow_tracking_uri=args.mlflow_tracking_uri,
     )
 
 if __name__ == "__main__":

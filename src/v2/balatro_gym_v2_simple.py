@@ -9,6 +9,7 @@ import numpy as np
 from gymnasium import spaces
 from typing import List, Tuple, Dict, Any, Optional
 import random
+from itertools import combinations
 import logging
 
 # Import the card and hand classes from the original environment
@@ -125,6 +126,7 @@ class BalatroGymEnvSimple(gym.Env):
         self.current_score = 0
         self.game_over = False
         self.won = False
+        self.consecutive_discards = 0
 
         # OpenAI Five-style multi-head action space (no 'pass' action):
         # - action_type: 0=play, 1=discard (2 values)
@@ -285,32 +287,75 @@ class BalatroGymEnvSimple(gym.Env):
     def _calculate_reward(self, action_type: str, result: Any) -> float:
         reward = 0.0
 
+        # Small time penalty to encourage efficiency
+        reward -= 0.1
+
         if action_type == "play":
             score_gained, hand_type = result
-            # Reward for score progress
-            reward += score_gained / 25.0
-            # Bonus for winning hand types
+            # Small base positive reward for taking a play action
+            reward += 2.0
+
+            # Normalized progress shaping (delta-based)
+            prev_progress = max(0.0, (self.current_score - score_gained) / max(1.0, float(self.blind_score)))
+            new_progress = min(1.0, self.current_score / max(1.0, float(self.blind_score)))
+            delta_progress = max(0.0, new_progress - prev_progress)
+            reward += 50.0 * delta_progress
+
+            # Reward from the immediate score gained normalized by blind
+            reward += 100.0 * (score_gained / max(1.0, float(self.blind_score)))
+
+            # Hand-type bonuses (gentler, guiding)
             hand_bonuses = {
-                "Royal Flush": 200,
-                "Straight Flush": 150,
-                "Four of a Kind": 100,
-                "Full House": 80,
-                "Flush": 60,
-                "Straight": 40,
-                "Three of a Kind": 30,
-                "Two Pair": 15,
-                "Pair": 5,
-                "High Card": -10,
+                "Royal Flush": 80,
+                "Straight Flush": 60,
+                "Four of a Kind": 45,
+                "Full House": 35,
+                "Flush": 25,
+                "Straight": 18,
+                "Three of a Kind": 12,
+                "Two Pair": 6,
+                "Pair": -2,
+                "High Card": -2,
             }
             reward += hand_bonuses.get(hand_type, 0)
-            # Penalty for playing weak hands if discards are available
-            if hand_type in ["High Card", "Pair"] and self.discards_left > 0:
-                reward -= 50.0
-            # Small reward for getting closer to the blind score
-            reward += 2.0 * (self.current_score / self.blind_score)
+
+            # Encourage using near-best available combination from current hand
+            try:
+                best_score, _best_type, _ = self._best_hand_score_and_indices()
+                if best_score > 0:
+                    quality = score_gained / best_score
+                    if quality >= 0.95:
+                        reward += 20.0
+                    elif quality >= 0.80:
+                        reward += 10.0
+            except Exception:
+                pass
+
+            # Mild penalty if playing obviously weak hand while discards remain
+            if hand_type in ["High Card", "Pair"] and self.discards_left > 0 and score_gained < 0.1 * self.blind_score:
+                reward -= 10.0
+
         elif action_type == "discard":
+            # Base cost for discarding to avoid degenerate discard-only policies
+            reward -= 2.0
+            # Escalating penalty for consecutive discards
+            reward -= max(0, self.consecutive_discards - 1) * 1.0
             if self.discards_left == 0:
-                reward -= 100.0
+                # Strong penalty for attempting to discard when none left
+                reward -= 200.0
+            else:
+                # Discouraging discard when a decent play likely exists
+                try:
+                    best_score, _best_type, _ = self._best_hand_score_and_indices()
+                    threshold_good = 0.10 * float(self.blind_score)
+                    threshold_poor = 0.05 * float(self.blind_score)
+                    if best_score >= threshold_good and self.plays_left > 0:
+                        reward -= 4.0
+                    elif best_score < threshold_poor:
+                        # Small allowance when hand is extremely weak
+                        reward += 1.0
+                except Exception:
+                    pass
 
         # Save last action for next step
         self.last_action = action_type
@@ -319,13 +364,33 @@ class BalatroGymEnvSimple(gym.Env):
         if self.current_score >= self.blind_score:
             self.game_over = True
             self.won = True
-            reward += 100.0  # Bonus for winning (increased from 50.0)
+            reward += 80.0  # Bonus for winning
         elif self.plays_left <= 0:
             self.game_over = True
             self.won = False
-            reward -= 50.0  # Penalty for running out of plays (increased from 20.0)
+            reward -= 20.0  # Penalty for running out of plays
 
         return reward
+
+    def _best_hand_score_and_indices(self) -> tuple:
+        """Compute best achievable hand score from current hand.
+        Returns (best_score, hand_type, indices).
+        """
+        best_score = 0
+        best_type = "High Card"
+        best_indices: list[int] = []
+        # Evaluate all combinations of 1..5 cards
+        for r in range(1, min(5, len(self.hand)) + 1):
+            for combo in combinations(range(len(self.hand)), r):
+                cards = [self.hand[i] for i in combo]
+                balatro_hand = BalatroHand(cards)
+                hand_type, base_chips, multiplier, card_chips = balatro_hand.evaluate_hand()
+                total_score = (base_chips + card_chips) * multiplier
+                if total_score > best_score:
+                    best_score = total_score
+                    best_type = hand_type
+                    best_indices = list(combo)
+        return float(best_score), best_type, best_indices
 
     def reset(self, seed=None, options=None):
         """Reset the environment"""
@@ -339,6 +404,7 @@ class BalatroGymEnvSimple(gym.Env):
         self.current_score = 0
         self.game_over = False
         self.won = False
+        self.consecutive_discards = 0
 
         return self._get_state(), {}
 
@@ -348,6 +414,12 @@ class BalatroGymEnvSimple(gym.Env):
             return self._get_state(), 0.0, True, False, {}
         # Decode multi-head action
         action_type, card_indices = self._decode_multi_head_action(action)
+
+        # Track consecutive discards
+        if action_type == "discard":
+            self.consecutive_discards += 1
+        else:
+            self.consecutive_discards = 0
 
         # Validate action
         if action_type == "play" and self.plays_left <= 0:
